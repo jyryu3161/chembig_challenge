@@ -1,0 +1,18 @@
+# HTTP IP access for the existing service, retaining its database and files.
+# Use with compose.yaml:compose.verify.yaml:compose.public.yaml, project chembig-e2e.
+services:
+  web:
+    image: chembig:public-8502
+    environment:
+      DEBUG: '0'
+      DJANGO_SETTINGS_MODULE: config.http_preview
+      ALLOWED_HOSTS: 52.78.201.155,localhost,127.0.0.1
+      CSRF_TRUSTED_ORIGINS: http://52.78.201.155:8502
+  worker:
+    image: chembig:public-8502
+    environment:
+      DEBUG: '0'
+      DJANGO_SETTINGS_MODULE: config.http_preview
+      ALLOWED_HOSTS: 52.78.201.155,localhost,127.0.0.1
+  nginx:
+    ports: !override ['0.0.0.0:8502:80']

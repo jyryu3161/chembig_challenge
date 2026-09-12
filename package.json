@@ -1,0 +1,1 @@
+{"name":"chembig-challenge","private":true,"scripts":{"build:css":"tailwindcss -i static/src/app.css -o static/app.css --minify"},"devDependencies":{"tailwindcss":"3.4.17"},"dependencies":{"htmx.org":"2.0.4"}}

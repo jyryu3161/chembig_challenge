@@ -1,0 +1,6 @@
+# Install as a server operator who can run Docker and read/write DATA_DIR.
+# Replace /opt/chembig with the installation path. Host cron times below are UTC.
+* * * * * cd /opt/chembig && flock -n /tmp/chembig-reconcile.lock docker compose exec -T web python manage.py reconcile >> /var/log/chembig-ops.log 2>&1
+0 18 * * * /opt/chembig/scripts/backup.sh >> /var/log/chembig-ops.log 2>&1
+17 3,15 * * * /opt/chembig/scripts/renew-cert.sh >> /var/log/chembig-ops.log 2>&1
+30 18 * * * cd /opt/chembig && docker compose exec -T web python manage.py clearsessions >> /var/log/chembig-ops.log 2>&1

@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block title %}{{ title }} · ChemBIG{% endblock %}{% block content %}<div class="form-box panel"><span class="eyebrow">ChemBIG account</span><h1>{{ title }}</h1><p class="intro">{{ intro }}</p><form method="post">{% csrf_token %}{{ form.as_p }}<button class="btn w-full">{{ button }}</button></form></div>{% endblock %}
