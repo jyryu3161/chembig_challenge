@@ -65,4 +65,15 @@ CELERY_TASK_TIME_LIMIT = 240
 CELERY_TASK_SOFT_TIME_LIMIT = 210
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_BROKER_TRANSPORT_OPTIONS = {'visibility_timeout': 300}
-SCORER_VERSION = 'chembig-1'
+SCORER_VERSION = 'chembig-2'  # bump whenever metric definitions change
+# Django's default logging is silent in production: its console handler requires DEBUG and mail_admins has no
+# ADMINS here, so 500 tracebacks were dropped. Write request errors and application logs to stdout for `docker compose logs`.
+LOGGING = {
+    'version': 1, 'disable_existing_loggers': False,
+    'formatters': {'plain': {'format': '%(asctime)s %(levelname)s %(name)s %(message)s'}},
+    'handlers': {'stdout': {'class': 'logging.StreamHandler', 'stream': 'ext://sys.stdout', 'formatter': 'plain'}},
+    'root': {'handlers': ['stdout'], 'level': 'WARNING'},
+    'loggers': {'django': {'handlers': ['stdout'], 'level': 'INFO' if DEBUG else 'WARNING', 'propagate': False},
+                'django.request': {'level': 'ERROR'},  # 4xx are already in the Nginx access log
+                'arena': {'handlers': ['stdout'], 'level': 'INFO', 'propagate': False}},
+}

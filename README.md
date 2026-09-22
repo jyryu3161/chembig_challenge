@@ -44,8 +44,9 @@ EC2에서는 검증한 이미지를 `docker load`로 받아 사용합니다. 상
 ## 구현 범위
 
 - 학년도·학기별 대회, 다중 문제, 참가 승인·정지, 별명·실명 선택, 공지와 작업 기록
-- 회귀 RMSE/MAE, 이진분류 ROC-AUC/AP, ID 기반 순서 독립 채점
-- 데이터 검사·학생용 파일 미리보기·게시 후 평가 설정 고정
+- 회귀 RMSE·MAE·MSE·R²·Pearson·Spearman, 이진분류 ROC-AUC·AUPRC·Log Loss·Accuracy·Balanced Accuracy·F1·MCC·Precision·Recall·Specificity 지표 레지스트리(`arena/scoring.py`), 문제별 순위 지표 1개 + 같은 유형의 나머지 지표를 참고값으로 자동 계산·저장, ID 기반 순서 독립 채점
+- `manage.py create_contest spec.json`으로 CSV·JSON 스펙에서 대회·문제 생성·게시, `scripts/fetch_tdc.py`로 TDC ADMET 벤치마크 과제를 플랫폼 CSV로 변환
+- 데이터 검사·학생용 파일 미리보기·게시 후 평가 설정 고정, 제출이 없는 대회·문제만 관리자 화면에서 삭제(데이터 파일·작업 기록 포함)
 - 학생·문제별 일일 한도, 요청 UUID에 의한 중복 방지, DB 상태 기반 채점 복구
 - 문제별 최고 val 순위, 최종 선택/자동 선택, 마감 후 test 채점·관리자 공개
 - OTP 관리자 인증, 해시 저장 일회용 학생 복구 코드와 기존 세션 해제

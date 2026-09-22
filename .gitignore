@@ -10,3 +10,7 @@ node_modules/
 *.sqlite3
 .coverage
 artifacts/
+# bkit plugin session state (machine-local)
+.bkit/
+docs/.bkit-memory.json
+docs/.pdca-status.json

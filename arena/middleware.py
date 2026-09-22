@@ -15,8 +15,9 @@ class AuthThrottleMiddleware:
             for scope in [f'ip:{ip}', f'account:{identity}']:
                 key = hashlib.sha256(scope.encode()).hexdigest()
                 with transaction.atomic():
-                    AuthAttempt.objects.get_or_create(key=key)
-                    row = AuthAttempt.objects.select_for_update().get(key=key)
+                    # One locked lookup-or-insert: a separate get_or_create() followed by a locked get() let the
+                    # reconcile purge delete a stale row in between and turn the login into DoesNotExist.
+                    row, _ = AuthAttempt.objects.select_for_update().get_or_create(key=key)
                     if row.window_start < timezone.now()-timedelta(minutes=15):
                         row.count, row.window_start = 0, timezone.now()
                     row.count += 1

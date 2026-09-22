@@ -9,8 +9,8 @@ from django.contrib.sessions.models import Session
 from django.core.exceptions import ValidationError, PermissionDenied
 from django.db import transaction
 from django.utils import timezone
-from .models import (Problem, Contest, Membership, Submission, FinalChoice, RecoveryCode, User, Audit)
-from .scoring import validate_datasets, validate_predictions, csv_bytes, read_csv, score
+from .models import (Problem, Contest, Membership, Submission, FinalChoice, RecoveryCode, User, Audit, Announcement)
+from .scoring import validate_datasets, validate_predictions, csv_bytes, read_csv, score, score_all
 
 
 def audit(actor, action, detail):
@@ -90,42 +90,93 @@ def expected_ids(p):
     return [r['sample_id'] for split in ('val','test') for r in read_csv(disk_path(p.manifest[split]['student']).read_bytes())[1]]
 
 
-def evaluate(p, raw, split):
-    predictions = validate_predictions(p, raw, expected_ids(p))
+def _predictions(p, raw):
+    return validate_predictions(p, raw, expected_ids(p))
+
+
+def _aligned(p, predictions, split):
     rows = read_csv(disk_path(p.manifest[split]['original']).read_bytes())[1]
-    return score(p.metric, [float(r[p.target_column]) for r in rows], [predictions[r[p.id_column]] for r in rows])
+    return [float(r[p.target_column]) for r in rows], [predictions[r[p.id_column]] for r in rows]
 
 
-@transaction.atomic
-def accept_submission(user, problem, raw, request_key, received_at):
-    # The contest lock serializes cutoff/finalization, the membership lock reserves quota.
-    contest = Contest.objects.select_for_update().get(pk=problem.contest_id)
-    membership = Membership.objects.select_for_update().filter(user=user, contest=contest, status='approved').first()
-    if not membership: raise PermissionDenied
-    existing = Submission.objects.filter(user=user, problem=problem, request_key=request_key).first()
-    if existing:
-        if existing.file_hash != hashlib.sha256(raw).hexdigest():
-            raise ValidationError('같은 요청 키에 다른 파일을 보낼 수 없습니다. 제출 화면을 새로 여세요.')
-        return existing
-    if not problem.published_at or not contest.visible or contest.finalized_at or not contest.opens_at <= received_at < contest.closes_at:
-        raise ValidationError('제출 기간이 아닙니다. 마감은 파일 전체의 서버 접수 완료 시각을 기준으로 합니다.')
-    if len(raw) > settings.MAX_CSV_BYTES: raise ValidationError('CSV 파일은 최대 10MB입니다.')
-    validate_predictions(problem, raw, expected_ids(problem))
-    # Reject numerical overflow as an invalid submission without consuming quota.
-    if problem.minimize:
-        try: evaluate(problem, raw, 'val'); evaluate(problem, raw, 'test')
-        except (FloatingPointError, OverflowError, ValueError): raise ValidationError('예측값의 수치 범위가 너무 큽니다.')
+def check_scorable(p, raw):
+    """Parse the CSV once and require the ranking metric to be defined on both val and test.
+
+    Undefined values (overflow, constant predictions for correlation metrics, ...) are rejected as invalid
+    submissions without consuming quota, instead of failing later in the worker or at finalization."""
+    predictions = _predictions(p, raw)
+    for split in ('val', 'test'):
+        score(p.metric, *_aligned(p, predictions, split))
+
+
+def evaluate_all(p, raw, split):
+    """(primary score, {metric key: value or None}) for every metric of the problem kind, each computed once."""
+    truth, predictions = _aligned(p, _predictions(p, raw), split)
+    details = score_all(p.kind, truth, predictions, primary=p.metric)
+    return details[p.metric], details
+
+
+PERIOD_CLOSED = '제출 기간이 아닙니다. 마감은 파일 전체의 서버 접수 완료 시각을 기준으로 합니다.'
+
+
+def _same_receipt(existing, digest):
+    if existing.file_hash != digest:
+        raise ValidationError('같은 요청 키에 다른 파일을 보낼 수 없습니다. 제출 화면을 새로 여세요.')
+    return existing
+
+
+def _accepting(problem, contest, received_at):
+    return problem.published_at and contest.visible and not contest.finalized_at and contest.opens_at <= received_at < contest.closes_at
+
+
+def _check_quota(user, problem, contest, received_at):
+    """Daily quota decision. Returns the KST quota day; raises when today's valid submissions are used up."""
     day = timezone.localtime(received_at).date()
     count = Submission.objects.filter(user=user, problem=problem, quota_day=day, quota_exempt=False).exclude(status='error').count()
     if count >= contest.daily_limit: raise ValidationError(f'오늘의 유효 제출 {contest.daily_limit}회를 모두 사용했습니다. 채점 대기도 횟수에 포함됩니다.')
-    sid = uuid.uuid4()
-    path = f'submissions/{user.pk}/{sid}.csv'
-    write_file(path, raw)
-    s = Submission.objects.create(id=sid, user=user, problem=problem, request_key=request_key, received_at=received_at,
-        quota_day=day, path=path, file_hash=hashlib.sha256(raw).hexdigest(), dataset_version=problem.dataset_version,
-        scorer_version=settings.SCORER_VERSION)
-    transaction.on_commit(lambda: dispatch(s.pk))
-    return s
+    return day
+
+
+DELETED = '문제 또는 대회가 삭제되었습니다. 대회 페이지를 새로 여세요.'
+
+
+def _gate(user, problem, contest, request_key, digest, received_at, lock=False):
+    """Checks shared by the advisory pass (before the CSV parse) and the authoritative pass (under the contest lock).
+
+    Returns (existing receipt, None) for a repeated request key, otherwise (None, quota day)."""
+    members = Membership.objects.filter(user=user, contest=contest, status='approved')
+    if lock: members = members.select_for_update()
+    if not members.exists(): raise PermissionDenied
+    existing = Submission.objects.filter(user=user, problem=problem, request_key=request_key).first()
+    if existing: return _same_receipt(existing, digest), None
+    if not _accepting(problem, contest, received_at): raise ValidationError(PERIOD_CLOSED)
+    return None, _check_quota(user, problem, contest, received_at)
+
+
+def accept_submission(user, problem, raw, request_key, received_at):
+    digest = hashlib.sha256(raw).hexdigest()
+    # Advisory pass: refuse an unauthorized, duplicate, late or over-quota request before the expensive parse.
+    existing, _ = _gate(user, problem, problem.contest, request_key, digest, received_at)
+    if existing: return existing
+    if len(raw) > settings.MAX_CSV_BYTES: raise ValidationError('CSV 파일은 최대 10MB입니다.')
+    # Parse and pre-score before taking any row lock: published data is immutable and CSV parsing dominates the
+    # request, so the contest-wide lock below covers only the quota decision and the receipt itself.
+    check_scorable(problem, raw)
+    with transaction.atomic():
+        # The contest lock serializes cutoff, finalization and deletion; the membership lock reserves quota.
+        contest = Contest.objects.select_for_update().filter(pk=problem.contest_id).first()
+        problem = Problem.objects.filter(pk=problem.pk).first()  # re-read: an operator may have deleted it meanwhile
+        if not contest or not problem: raise ValidationError(DELETED)
+        existing, day = _gate(user, problem, contest, request_key, digest, received_at, lock=True)
+        if existing: return existing
+        sid = uuid.uuid4()
+        path = f'submissions/{user.pk}/{sid}.csv'
+        write_file(path, raw)
+        s = Submission.objects.create(id=sid, user=user, problem=problem, request_key=request_key, received_at=received_at,
+            quota_day=day, path=path, file_hash=digest, dataset_version=problem.dataset_version,
+            scorer_version=settings.SCORER_VERSION)
+        transaction.on_commit(lambda: dispatch(s.pk))
+        return s
 
 
 def dispatch(sid):
@@ -167,8 +218,8 @@ def finalize(contest_id, actor=None):
                 s = ordered_scores(p, submissions.filter(user_id=uid)).first()
                 choice = FinalChoice.objects.create(user_id=uid, problem=p, submission=s, automatic=True)
             s = choice.submission
-            s.test_score = evaluate(p, disk_path(s.path).read_bytes(), 'test')
-            s.save(update_fields=['test_score'])
+            s.test_score, s.test_metrics = evaluate_all(p, disk_path(s.path).read_bytes(), 'test')
+            s.save(update_fields=['test_score', 'test_metrics'])
     c.finalized_at = timezone.now()
     c.save(update_fields=['finalized_at'])
     audit(actor, '최종 제출 확정·test 채점', c.pk)
@@ -199,6 +250,68 @@ def retry_submission(sid, actor):
     s.save(update_fields=['status','attempts','error','quota_exempt'])
     audit(actor, '채점 재처리', sid)
     transaction.on_commit(lambda: dispatch(s.pk))
+
+
+# Deletion. Every foreign key is PROTECT and the admin hides the ORM delete on purpose: graded work is never removed.
+# The one legitimate case is a contest or problem that never received a submission (a test run, a wrong spec).
+def contest_deletable(contest):
+    return not Submission.objects.filter(problem__contest=contest).exists()
+
+
+def problem_deletable(problem):
+    return not problem.contest.ended and not Submission.objects.filter(problem=problem).exists()
+
+
+def contest_summary(contest):
+    """Row counts shown on the delete confirmation and written to the audit log."""
+    return {'problems': contest.problems.count(), 'memberships': Membership.objects.filter(contest=contest).count(),
+            'announcements': Announcement.objects.filter(contest=contest).count(),
+            'submissions': Submission.objects.filter(problem__contest=contest).count()}
+
+
+def _remove_problem_files(problem_ids):
+    """Drop originals/<pk> and student/<pk> of deleted problems. Runs after commit; a failure only leaves orphans."""
+    import logging
+    import shutil
+    for pk in problem_ids:
+        for prefix in ('originals', 'student'):
+            path = disk_path(f'{prefix}/{pk}')
+            try: shutil.rmtree(path)
+            except FileNotFoundError: pass
+            except OSError: logging.getLogger(__name__).warning('Could not remove data folder %s of deleted problem %s', path, pk)
+
+
+def _delete_problem_rows(problems):
+    ids = [p.pk for p in problems]
+    FinalChoice.objects.filter(problem_id__in=ids).delete()  # cannot exist without submissions; explicit for PROTECT
+    Problem.objects.filter(pk__in=ids).delete()
+    transaction.on_commit(lambda: _remove_problem_files(ids))
+    return ids
+
+
+@transaction.atomic
+def delete_problem(problem_id, actor):
+    p = Problem.objects.select_related('contest').get(pk=problem_id)
+    c = Contest.objects.select_for_update().get(pk=p.contest_id)  # serializes with accept_submission's contest lock
+    p = Problem.objects.select_for_update().get(pk=problem_id)
+    if c.ended: raise ValidationError('종료된 대회의 문제는 삭제할 수 없습니다.')
+    if Submission.objects.filter(problem=p).exists(): raise ValidationError('제출이 있는 문제는 삭제할 수 없습니다.')
+    _delete_problem_rows([p])
+    audit(actor, '문제 삭제', f'{c.pk}/{p.pk} "{p.title}"')
+
+
+@transaction.atomic
+def delete_contest(contest_id, actor):
+    c = Contest.objects.select_for_update().get(pk=contest_id)
+    if not contest_deletable(c):
+        raise ValidationError('제출이 있는 대회는 삭제할 수 없습니다. 보관하려면 대회 표시를 끄세요.')
+    n = contest_summary(c)
+    Announcement.objects.filter(contest=c).delete()
+    Membership.objects.filter(contest=c).delete()
+    _delete_problem_rows(list(c.problems.all()))
+    title = c.title
+    c.delete()
+    audit(actor, '대회 삭제', f'{contest_id} "{title}" · 문제 {n["problems"]}개 · 참가 신청 {n["memberships"]}건 · 공지 {n["announcements"]}건')
 
 
 @transaction.atomic

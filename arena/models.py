@@ -3,6 +3,7 @@ from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
+from . import scoring
 
 class User(AbstractUser):
     real_name = models.CharField('이름', max_length=60)
@@ -44,8 +45,11 @@ class Contest(models.Model):
     def __str__(self):
         return self.title
     def clean(self):
-        if self.opens_at >= self.closes_at or not self.daily_limit:
-            raise ValidationError('종료는 시작 이후, 제출 제한은 1 이상이어야 합니다.')
+        # full_clean() still calls clean() after field errors, so blank dates arrive here as None.
+        if self.opens_at and self.closes_at and self.opens_at >= self.closes_at:
+            raise ValidationError('종료는 시작 이후여야 합니다.')
+        if self.daily_limit is not None and self.daily_limit < 1:
+            raise ValidationError('제출 제한은 1 이상이어야 합니다.')
         if self.pk:
             old = Contest.objects.get(pk=self.pk)
             if old.finalized_at or old.closes_at <= timezone.now():
@@ -79,11 +83,12 @@ class Membership(models.Model):
         verbose_name_plural = verbose_name
 
 class Problem(models.Model):
-    METRICS = [('rmse', 'RMSE'), ('mae', 'MAE'), ('roc_auc', 'ROC-AUC'), ('ap', 'Average Precision')]
+    METRICS = scoring.METRIC_CHOICES
     contest = models.ForeignKey(Contest, on_delete=models.PROTECT, related_name='problems')
     title = models.CharField('문제명', max_length=160)
-    kind = models.CharField('유형', max_length=16, choices=[('regression', '회귀'), ('binary', '이진분류')])
-    metric = models.CharField('평가 지표', max_length=12, choices=METRICS, default='rmse')
+    kind = models.CharField('유형', max_length=16, choices=scoring.KINDS)
+    metric = models.CharField('순위 지표', max_length=24, choices=METRICS, default='rmse',
+        help_text='순위를 결정하는 주 지표입니다. 같은 유형의 나머지 지표는 참고용으로 함께 계산됩니다.')
     description = models.TextField('예측 대상·설명')
     units = models.CharField('단위·변환', max_length=200)
     source = models.TextField('데이터 출처')
@@ -102,12 +107,21 @@ class Problem(models.Model):
         ordering = ['pk']
     def __str__(self): return self.title
     @property
-    def minimize(self): return self.metric in ('rmse', 'mae')
+    def minimize(self): return scoring.REGISTRY[self.metric].minimize
+    @property
+    def metric_label(self): return scoring.REGISTRY[self.metric].label
+    @property
+    def all_metrics(self):
+        """Every metric computed for this problem's kind, primary first."""
+        return [scoring.REGISTRY[self.metric], *[m for m in scoring.metrics_for(self.kind) if m.key != self.metric]]
+    @property
+    def secondary_metrics(self): return self.all_metrics[1:]
     def clean(self):
         if self.contest_id and self.contest.ended and not self.published_at:
             raise ValidationError('종료된 대회에 문제를 추가하거나 수정할 수 없습니다.')
-        if (self.kind == 'regression') != (self.metric in ('rmse', 'mae')):
-            raise ValidationError('회귀는 RMSE/MAE, 이진분류는 ROC-AUC/AP를 선택하세요.')
+        if self.metric not in scoring.REGISTRY or scoring.metric_kind(self.metric) != self.kind:
+            allowed = ', '.join(m.label for m in scoring.metrics_for(self.kind))
+            raise ValidationError(f'{self.get_kind_display()} 문제의 순위 지표는 {allowed} 중에서 선택하세요.')
         if not isinstance(self.feature_columns, list) or not all(isinstance(x, str) for x in self.feature_columns):
             raise ValidationError('공개 특징 열은 문자열의 JSON 배열이어야 합니다.')
         cols = [self.id_column, self.smiles_column, self.target_column, *self.feature_columns]
@@ -135,6 +149,9 @@ class Submission(models.Model):
     status = models.CharField(max_length=16, choices=STATUS, default='pending')
     val_score = models.FloatField(null=True, blank=True)
     test_score = models.FloatField(null=True, blank=True)
+    # Every metric of the problem kind, keyed by metric key; the primary metric is duplicated in *_score for ranking.
+    val_metrics = models.JSONField(default=dict, blank=True)
+    test_metrics = models.JSONField(default=dict, blank=True)
     attempts = models.PositiveSmallIntegerField(default=0)
     quota_exempt = models.BooleanField(default=False, editable=False)
     lease = models.UUIDField(null=True)

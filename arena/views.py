@@ -11,14 +11,28 @@ from django.contrib.auth import login
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.http import FileResponse, Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 from .models import Contest, Problem, Membership, Submission, FinalChoice, Announcement, User, Audit
 from .forms import SignupForm, ProfileForm, JoinForm, UploadForm, DatasetForm, RecoveryForm, CloneForm
-from . import services
+from . import services, scoring
+
+
+def pk_or_none(value):
+    """Primary key from a query/form string. isdecimal(), not isdigit(): '²' passes isdigit() but int() rejects it."""
+    return int(value) if isinstance(value, str) and value.isdecimal() else None
+
+
+def metric_details(metrics, primary, values, score):
+    """[(label, value-or-None, is_primary)] in display order for a stored metrics dict.
+
+    Submissions scored before chembig-2 have a score but no stored details; show the stored score for the ranking
+    metric so the panel agrees with the score column until backfill_metrics fills the rest."""
+    values = values or {}
+    return [(m.label, score if m.key == primary and m.key not in values else values.get(m.key), m.key == primary) for m in metrics]
 
 
 def staff_only(view):
@@ -46,7 +60,7 @@ def home(request):
     contests = Contest.objects.filter(visible=True)
     return render(request, 'arena/home.html', {'contests':contests.filter(closes_at__gt=now)[:3],
         'active_count':contests.filter(opens_at__lte=now, closes_at__gt=now).count(),
-        'archive_count':contests.filter(closes_at__lte=now).count(),
+        'archive_count':contests.filter(closes_at__lte=now).count(), 'metric_count':len(scoring.REGISTRY),
         'announcements':Announcement.objects.filter(Q(contest__isnull=True)|Q(contest__visible=True))[:4]})
 
 
@@ -97,24 +111,31 @@ def contest(request, pk, tab='overview'):
     allowed = is_operator(request.user) or bool(member and member.status == 'approved')
     if tab in ['problems','leaderboard','submit','submissions']: access(request,c)
     problems = c.problems.filter(published_at__isnull=False)
-    selected = problems.filter(pk=request.GET.get('problem')).first() if request.GET.get('problem','').isdigit() else problems.first()
+    wanted = pk_or_none(request.GET.get('problem'))
+    selected = problems.filter(pk=wanted).first() if wanted is not None else problems.first()
     rows = []
     if selected and tab == 'leaderboard':
         qs = Submission.objects.filter(problem=selected, status='scored', user__membership__contest=c, user__membership__status='approved').select_related('user')
         if c.released_at: qs = qs.filter(finalchoice__problem=selected)
-        seen = set()
+        seen, secondary = set(), selected.secondary_metrics
         for s in services.ordered_scores(selected, qs, final=bool(c.released_at)):
             if s.user_id not in seen:
                 seen.add(s.user_id)
+                details = s.test_metrics if c.released_at else s.val_metrics
                 rows.append({'rank':len(rows)+1, 'name':s.user.public_name, 'mine':s.user_id==request.user.pk,
-                    'score':s.test_score if c.released_at else s.val_score, 'received_at':s.received_at})
+                    'score':s.test_score if c.released_at else s.val_score, 'received_at':s.received_at,
+                    'extras':[(details or {}).get(m.key) for m in secondary]})
     submissions = []
     if tab == 'submissions':
         choices = set(FinalChoice.objects.filter(user=request.user, problem__contest=c).values_list('submission_id', flat=True))
+        metrics = {}  # problem pk -> metric list, built once per problem instead of per submission
         for s in Submission.objects.filter(user=request.user, problem__contest=c).select_related('problem').order_by('-received_at')[:200]:
+            if s.problem_id not in metrics: metrics[s.problem_id] = s.problem.all_metrics
             submissions.append({'id':s.pk, 'problem':s.problem, 'received_at':s.received_at, 'status':s.get_status_display(),
                 'val_score':s.val_score, 'test_score':s.test_score if c.released_at else None, 'selected':s.pk in choices,
-                'can_select':c.is_open and s.status=='scored'})
+                'can_select':c.is_open and s.status=='scored',
+                'val_details':metric_details(metrics[s.problem_id], s.problem.metric, s.val_metrics, s.val_score),
+                'test_details':metric_details(metrics[s.problem_id], s.problem.metric, s.test_metrics, s.test_score) if c.released_at else []})
     return render(request, 'arena/contest.html', {'contest':c,'tab':tab,'membership':member,'allowed':allowed,'problems':problems,
         'selected_problem':selected,'rows':rows,'submissions':submissions,'join_form':JoinForm(),
         'upload_form':UploadForm(initial={'request_key':uuid.uuid4()}),
@@ -126,7 +147,8 @@ def contest(request, pk, tab='overview'):
 def join(request, pk):
     c = get_object_or_404(Contest, pk=pk, visible=True)
     form = JoinForm(request.POST)
-    if not c.ended and form.is_valid() and secrets.compare_digest(form.cleaned_data['invite_code'], c.invite_code):
+    # compare_digest on str rejects non-ASCII input with TypeError; compare UTF-8 bytes so a Korean code or typo is just a mismatch.
+    if not c.ended and form.is_valid() and secrets.compare_digest(form.cleaned_data['invite_code'].encode(), c.invite_code.encode()):
         try:
             with transaction.atomic():
                 Membership.objects.get_or_create(user=request.user, contest=c, defaults={'student_id':request.user.student_id})
@@ -201,7 +223,7 @@ def operations(request):
     backup = None
     try: backup = json.loads((root/'backups'/'last_success.json').read_text())
     except (OSError, ValueError): pass
-    return render(request, 'arena/operations.html', {'contests':Contest.objects.all(),
+    return render(request, 'arena/operations.html', {'contests':Contest.objects.annotate(n_submissions=Count('problems__submission')),
         'members':Membership.objects.select_related('user','contest').order_by('status','created_at'),
         'failed':Submission.objects.filter(status='error').select_related('user','problem'),
         'pending':Submission.objects.filter(status__in=['pending','processing']).count(),
@@ -213,8 +235,9 @@ def operations(request):
 def approve(request):
     state = request.POST.get('state')
     if state not in ['approved','suspended']: raise Http404
+    selected = [pk for pk in map(pk_or_none, request.POST.getlist('members')) if pk is not None]
     with transaction.atomic():
-        qs = Membership.objects.select_for_update().filter(pk__in=request.POST.getlist('members'), contest__closes_at__gt=timezone.now())
+        qs = Membership.objects.select_for_update().filter(pk__in=selected, contest__closes_at__gt=timezone.now())
         for m in qs:
             m.status=state
             m.save(update_fields=['status'])
@@ -292,7 +315,7 @@ def export(request,pk):
     c=get_object_or_404(Contest,pk=pk)
     out=io.StringIO(newline='')
     writer=csv.writer(out)
-    writer.writerow(['대회','문제','이름','학번','별명','순위','점수','평가','제출 횟수'])
+    writer.writerow(['대회','문제','이름','학번','별명','순위','점수','순위 지표','평가','세부 지표','제출 횟수'])
     def safe(v):
         s=str(v)
         return "'"+s if s.startswith(('=','+','-','@','\t','\r','\n')) else s
@@ -302,11 +325,15 @@ def export(request,pk):
         best={}
         for item in services.ordered_scores(p,qs,final=bool(c.released_at)):
             if item.user_id not in best: best[item.user_id]=(len(best)+1,item)
+        counts={row['user_id']:row['n'] for row in Submission.objects.filter(problem=p).values('user_id').annotate(n=Count('id'))}
+        secondary=p.secondary_metrics
         for member in Membership.objects.filter(contest=c,status='approved').select_related('user').order_by('student_id'):
             rank,item=best.get(member.user_id,('',None))
             value=(item.test_score if c.released_at else item.val_score) if item else ''
+            details=((item.test_metrics if c.released_at else item.val_metrics) or {}) if item else {}
+            detail_text='; '.join(f'{m.label}={details[m.key]:.6g}' for m in secondary if details.get(m.key) is not None)
             writer.writerow([safe(c.title),safe(p.title),safe(member.user.real_name),safe(member.student_id),safe(member.user.nickname),rank,
-                value,'test' if c.released_at else 'val',Submission.objects.filter(user=member.user,problem=p).count()])
+                value,p.metric_label,'test' if c.released_at else 'val',safe(detail_text),counts.get(member.user_id,0)])
     services.audit(request.user,'성적 CSV 내보내기',pk)
     response=HttpResponse('\ufeff'+out.getvalue(),content_type='text/csv; charset=utf-8')
     response['Content-Disposition']=f'attachment; filename="contest-{pk}-grades.csv"'

@@ -5,7 +5,7 @@
 3. 문제의 예측 대상, 단위·변환, 데이터 출처, 분할 방법과 지표를 읽습니다. `train.csv`에는 정답이 있으며 `val.csv`·`test.csv`에는 없습니다.
 4. `sample_submission.csv`의 `prediction` 열을 채웁니다. val·test 전체 ID가 필요합니다. ID는 문자열이며 앞자리 0을 유지하세요. 행 순서는 자유입니다.
 5. `sample_id,prediction` 두 열의 UTF-8 CSV를 제출합니다. 파일 한도는 10MB입니다. 분류는 양성 클래스 확률 0~1, 회귀는 지정된 단위로 제출합니다.
-6. 내 제출에서 채점 결과를 확인합니다. 진행 중 순위는 문제별 최고 val 점수입니다.
+6. 내 제출에서 채점 결과를 확인합니다. 진행 중 순위는 문제별 최고 val 점수입니다. 순위는 문제에 지정된 순위 지표 하나로 정해지며, 같은 유형의 나머지 지표(회귀: RMSE·MAE·MSE·R²·Pearson·Spearman, 분류: ROC-AUC·AUPRC·Log Loss·Accuracy·Balanced Accuracy·F1·MCC·Precision·Recall·Specificity)는 `세부 지표`에서 참고할 수 있습니다. 분류의 라벨 지표는 제출한 확률을 0.5 기준으로 나눠 계산합니다.
 7. 마감 전 채점 완료 제출 중 문제별 하나를 최종 지정합니다. 미지정이면 최고 val 제출을 자동 선택합니다. 마감 전 접수된 작업은 마감 후에도 채점합니다.
 8. 관리자가 결과를 공개하면 선택된 제출의 test 점수와 최종 순위를 확인합니다. test 정답은 공개하지 않습니다.
 

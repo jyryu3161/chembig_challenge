@@ -1,3 +1,4 @@
+import math
 import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -81,6 +82,20 @@ class ScoringTests(Fixtures, TestCase):
         self.assertTrue(self.p.warnings)
     def test_overflow_is_invalid(self):
         with self.assertRaises(ValidationError):self.accept(self.raw.replace(b'val_001,0',b'val_001,1e308'))
+    def test_large_finite_predictions_keep_rank_correlation_defined(self):
+        # np.std squared 1e200 and overflowed, misreporting a defined Spearman as 'constant predictions'.
+        self.assertEqual(score('spearman',[0,1,2],[1e200,0,-1e200]),-1)
+        with self.assertRaisesMessage(ValidationError,'수치 범위'):score('pearson',[0,1,2],[1e200,0,-1e200])
+        with self.assertRaisesMessage(ValidationError,'모두 같으면'):score('pearson',[0,1,2],[3,3,3])
+    def test_internal_metric_error_is_not_blamed_on_the_student(self):
+        from arena import scoring
+        broken=scoring.Metric('rmse','RMSE','regression',True,lambda y,p:(_ for _ in ()).throw(ValueError('sklearn API changed')))
+        with patch.dict(scoring.REGISTRY,{'rmse':broken}):
+            with self.assertRaises(ValueError):score('rmse',[0,1],[0,1])  # ranking metric: a server error, never '파일 오류'
+            with self.assertRaises(ValueError):scoring.score_all('regression',[0,1],[0,1],primary='rmse')
+            with self.assertLogs('arena.scoring',level='ERROR') as log:  # reference metric: logged, stored as None
+                details=scoring.score_all('regression',[0,1],[0,1],primary='mae')
+        self.assertIsNone(details['rmse']);self.assertEqual(details['mae'],0);self.assertIn('rmse',log.output[0])
     def test_immutable_publication(self):
         with self.assertRaises(ValidationError): services.prepare_data(self.p.pk,self.files,None)
         self.p.metric='mae'
@@ -109,6 +124,21 @@ class WorkflowTests(Fixtures, TestCase):
         self.accept(at=self.c.closes_at-timedelta(microseconds=1))
         with self.assertRaises(ValidationError):self.accept(at=self.c.closes_at)
         with self.assertRaises(ValidationError):self.accept(at=self.c.opens_at-timedelta(microseconds=1))
+        # After the deadline the period message wins even for a malformed file, and nothing is written.
+        with self.assertRaisesMessage(ValidationError,'제출 기간이 아닙니다'):self.accept(raw=b'garbage',at=self.c.closes_at)
+        self.assertEqual(Submission.objects.count(),1)
+    def test_contest_clean_reports_blank_fields_as_validation_error(self):
+        with self.assertRaises(ValidationError):Contest(semester=self.semester,title='x',description='d').full_clean()
+        now=timezone.now()
+        with self.assertRaisesMessage(ValidationError,'종료는 시작 이후'):
+            Contest(semester=self.semester,title='x',description='d',invite_code='c',opens_at=now,closes_at=now).full_clean()
+        with self.assertRaisesMessage(ValidationError,'1 이상'):
+            Contest(semester=self.semester,title='x',description='d',invite_code='c',opens_at=now,closes_at=now+timedelta(days=1),daily_limit=0).full_clean()
+    def test_reconcile_purges_stale_auth_attempts(self):
+        AuthAttempt.objects.create(key='old',window_start=timezone.now()-timedelta(days=2))
+        AuthAttempt.objects.create(key='fresh')
+        with patch('arena.tasks.dispatch'):reconcile()
+        self.assertEqual(list(AuthAttempt.objects.values_list('key',flat=True)),['fresh'])
     def test_finalization_waits_and_test_secrecy(self):
         s=self.accept();self.finish()
         with self.assertRaises(ValidationError):services.finalize(self.c.pk)
@@ -132,12 +162,26 @@ class WorkflowTests(Fixtures, TestCase):
         self.assertEqual(FinalChoice.objects.get(user=self.u).submission_id,best.pk)
     def test_retry_max_and_once_only(self):
         s=self.accept()
-        with patch('arena.tasks.evaluate',side_effect=OSError('disk')):
+        with patch('arena.tasks.evaluate_all',side_effect=OSError('disk')):
             for i in range(4):grade(str(s.pk))
         s.refresh_from_db();self.assertEqual((s.status,s.attempts),('error',4))
         grade(str(s.pk));s.refresh_from_db();self.assertEqual(s.attempts,4)
         services.retry_submission(s.pk,self.u);grade(str(s.pk));grade(str(s.pk));s.refresh_from_db()
         self.assertEqual((s.status,s.attempts,s.val_score),('scored',1,0))
+    def test_pending_submission_is_graded_under_current_scorer(self):
+        # A SCORER_VERSION bump must not strand pending submissions: grade with the current scorer, stamp it, warn.
+        s=self.accept();Submission.objects.filter(pk=s.pk).update(scorer_version='chembig-0')
+        with self.assertLogs('arena.tasks',level='WARNING') as log:grade(str(s.pk))
+        s.refresh_from_db();self.assertEqual((s.status,s.val_score,s.scorer_version),('scored',0,settings.SCORER_VERSION))
+        self.assertIn('chembig-0',log.output[0])
+        stale=self.accept();Submission.objects.filter(pk=stale.pk).update(dataset_version='other')
+        for _ in range(4):grade(str(stale.pk))
+        stale.refresh_from_db();self.assertEqual(stale.status,'error')  # data changed under the receipt: still a server error
+    def test_quota_refused_before_parsing(self):
+        for _ in range(5):self.accept()
+        with patch('arena.services.check_scorable') as scorable:
+            with self.assertRaisesMessage(ValidationError,'모두 사용'):self.accept(raw=b'not,a,valid\ncsv')
+        scorable.assert_not_called()
     def test_worker_lease_recovery(self):
         s=self.accept()
         Submission.objects.filter(pk=s.pk).update(status='processing',started_at=timezone.now()-timedelta(minutes=6),attempts=1,lease=uuid.uuid4())
@@ -223,6 +267,20 @@ class AccessTests(Fixtures, TestCase):
         response=self.client.post(f'/problems/{self.p.pk}/submit/',{'request_key':uuid.uuid4(),'file':SimpleUploadedFile('x.csv',self.raw)})
         self.assertEqual(response.status_code,302)
         self.assertEqual(Submission.objects.count(),1)
+    def test_join_with_non_ascii_invite_code(self):
+        self.c.invite_code='화학-2026';self.c.save(update_fields=['invite_code'])
+        self.client.force_login(self.other)
+        self.assertEqual(self.client.post(f'/contests/{self.c.pk}/join/',{'invite_code':'틀린 코드'}).status_code,302)
+        self.assertFalse(Membership.objects.filter(user=self.other).exists())
+        self.assertEqual(self.client.post(f'/contests/{self.c.pk}/join/',{'invite_code':'화학-2026'}).status_code,302)
+        self.assertEqual(Membership.objects.get(user=self.other).status,'pending')
+    def test_approve_ignores_malformed_member_ids(self):
+        self.other.is_staff=True;self.other.is_superuser=True;self.other.save()
+        device=TOTPDevice.objects.create(user=self.other,name='test',confirmed=True)
+        self.client.force_login(self.other);session=self.client.session;session['otp_device_id']=device.persistent_id;session.save()
+        response=self.client.post('/ops/approve/',{'state':'suspended','members':['abc','','\u00b2','\u2460',str(self.m.pk)]})
+        self.assertEqual(response.status_code,302);self.m.refresh_from_db();self.assertEqual(self.m.status,'suspended')
+        self.assertEqual(self.client.get(f'/contests/{self.c.pk}/leaderboard/?problem=\u00b2').status_code,200)  # as the operator
     def test_duplicate_student_join(self):
         self.other.student_id=self.u.student_id;self.other.save();self.client.force_login(self.other)
         self.client.post(f'/contests/{self.c.pk}/join/',{'invite_code':'CODE'})
@@ -304,3 +362,228 @@ class BinaryWorkflowTests(Fixtures, TestCase):
         self.assertEqual(s.val_score,1)
         self.finish();services.finalize(self.c.pk)
         s.refresh_from_db();self.assertEqual(s.test_score,1)
+
+class MetricRegistryTests(Fixtures, TestCase):
+    def test_every_metric_kind_is_covered(self):
+        from arena.scoring import REGISTRY, metrics_for, score_all
+        self.assertEqual({m.kind for m in REGISTRY.values()}, {'regression','binary'})
+        self.assertEqual({m.key for m in metrics_for('regression')}, {'rmse','mae','mse','r2','pearson','spearman'})
+        self.assertEqual({m.key for m in metrics_for('binary')}, {'roc_auc','ap','log_loss','accuracy','balanced_accuracy','f1','mcc','precision','recall','specificity'})
+        self.assertEqual(set(score_all('regression',[1,2,3],[1,2,3])), {m.key for m in metrics_for('regression')})
+        self.assertEqual(set(score_all('binary',[0,1],[.2,.8])), {m.key for m in metrics_for('binary')})
+    def test_regression_metric_values(self):
+        y,p=[1,2,3,4],[1.5,2.5,2.5,4.5]
+        self.assertAlmostEqual(score('mse',y,p),0.25);self.assertAlmostEqual(score('rmse',y,p),0.5);self.assertAlmostEqual(score('mae',y,p),0.5)
+        self.assertAlmostEqual(score('r2',y,p),1-1/5)
+        self.assertAlmostEqual(score('pearson',[1,2,3],[2,4,6]),1);self.assertAlmostEqual(score('spearman',[1,2,3],[1,10,100]),1)
+        self.assertAlmostEqual(score('spearman',[1,2,3],[3,2,1]),-1)
+        for metric in ['pearson','spearman']:
+            with self.assertRaises(ValidationError):score(metric,[1,2,3],[5,5,5])
+    def test_binary_metric_values(self):
+        y,p=[0,0,1,1],[.1,.6,.4,.9]
+        self.assertAlmostEqual(score('accuracy',y,p),0.5);self.assertAlmostEqual(score('precision',y,p),0.5)
+        self.assertAlmostEqual(score('recall',y,p),0.5);self.assertAlmostEqual(score('specificity',y,p),0.5)
+        self.assertAlmostEqual(score('f1',y,p),0.5);self.assertAlmostEqual(score('balanced_accuracy',y,p),0.5);self.assertAlmostEqual(score('mcc',y,p),0)
+        self.assertAlmostEqual(score('roc_auc',y,p),0.75);self.assertGreater(score('log_loss',y,p),0)
+        self.assertTrue(math.isfinite(score('log_loss',[0,1],[0,1])))
+        self.assertEqual(score('precision',[0,1],[.1,.2]),0)
+    def test_problem_metric_must_match_kind(self):
+        for kind,metric in [('regression','roc_auc'),('binary','rmse'),('binary','spearman'),('regression','f1')]:
+            with self.assertRaises(ValidationError):
+                Problem(contest=self.c,title='x',kind=kind,metric=metric,description='d',units='u',source='s',split_method='m').full_clean()
+        Problem(contest=self.c,title='x',kind='regression',metric='spearman',description='d',units='u',source='s',split_method='m').full_clean()
+        p=Problem(contest=self.c,title='x',kind='binary',metric='mcc',description='d',units='u',source='s',split_method='m')
+        self.assertFalse(p.minimize);self.assertEqual(p.all_metrics[0].key,'mcc');self.assertNotIn('mcc',[m.key for m in p.secondary_metrics])
+        self.assertTrue(Problem(kind='binary',metric='log_loss').minimize)
+    def test_detail_metrics_stored_for_val_and_test(self):
+        s=self.accept();grade(str(s.pk));s.refresh_from_db()
+        self.assertEqual(s.val_score,0);self.assertEqual(s.val_metrics['rmse'],0);self.assertEqual(s.val_metrics['mae'],0)
+        self.assertAlmostEqual(s.val_metrics['r2'],1);self.assertAlmostEqual(s.val_metrics['pearson'],1);self.assertAlmostEqual(s.val_metrics['spearman'],1)
+        self.assertEqual(s.test_metrics,{})
+        self.finish();services.finalize(self.c.pk);s.refresh_from_db()
+        self.assertEqual(s.test_score,0);self.assertEqual(s.test_metrics['rmse'],0);self.assertEqual(s.test_metrics['r2'],1)
+    def test_undefined_secondary_metric_is_none_not_failure(self):
+        s=self.accept(self.raw.replace(b'val_002,1',b'val_002,0').replace(b'test_002,1',b'test_002,0'));grade(str(s.pk));s.refresh_from_db()
+        self.assertEqual(s.status,'scored');self.assertIsNone(s.val_metrics['pearson']);self.assertIsNone(s.val_metrics['spearman'])
+    def test_undefined_primary_metric_rejected_without_quota(self):
+        p=Problem.objects.create(contest=self.c,title='상관',kind='regression',metric='spearman',description='d',units='u',source='s',split_method='m')
+        services.prepare_data(p.pk,self.files,None);services.publish_problem(p.pk,None);p.refresh_from_db()
+        constant=self.raw.replace(b'val_002,1',b'val_002,0').replace(b'test_002,1',b'test_002,0')
+        with self.assertRaises(ValidationError):services.accept_submission(self.u,p,constant,uuid.uuid4(),timezone.now())
+        self.assertEqual(Submission.objects.filter(problem=p).count(),0)
+        s=services.accept_submission(self.u,p,self.raw,uuid.uuid4(),timezone.now());grade(str(s.pk));s.refresh_from_db()
+        self.assertAlmostEqual(s.val_score,1)
+    def test_binary_details_and_leaderboard_columns(self):
+        p=Problem.objects.create(contest=self.c,title='분류',kind='binary',metric='ap',description='양성 확률',units='확률',source='합성',split_method='고정')
+        services.prepare_data(p.pk,self.files,None);services.publish_problem(p.pk,None);p.refresh_from_db()
+        s=services.accept_submission(self.u,p,self.raw.replace(b',1',b',0.9').replace(b',0\n',b',0.2\n'),uuid.uuid4(),timezone.now())
+        grade(str(s.pk));s.refresh_from_db()
+        self.assertEqual(s.val_score,1);self.assertEqual(s.val_metrics['accuracy'],1);self.assertEqual(s.val_metrics['mcc'],1);self.assertEqual(s.val_metrics['specificity'],1)
+        self.client.force_login(self.u)
+        response=self.client.get(f'/contests/{self.c.pk}/leaderboard/?problem={p.pk}')
+        for label in ['AUPRC (Average Precision)','ROC-AUC','Balanced Accuracy','Specificity','Log Loss']:self.assertContains(response,label)
+        response=self.client.get(f'/contests/{self.c.pk}/submissions/')
+        self.assertContains(response,'세부 지표');self.assertContains(response,'MCC')
+        self.assertNotContains(response,'test_metrics')
+    def test_export_has_detail_metrics(self):
+        s=self.accept();grade(str(s.pk))
+        self.other.is_staff=True;self.other.is_superuser=True;self.other.save()
+        device=TOTPDevice.objects.create(user=self.other,name='test',confirmed=True)
+        self.client.force_login(self.other);session=self.client.session;session['otp_device_id']=device.persistent_id;session.save()
+        body=self.client.get(f'/ops/contests/{self.c.pk}/export/').content.decode('utf-8-sig')
+        self.assertIn('세부 지표',body);self.assertIn('MAE=0',body);self.assertIn('RMSE',body)
+
+    def test_legacy_submission_details_show_stored_ranking_score(self):
+        s=self.accept();grade(str(s.pk));Submission.objects.filter(pk=s.pk).update(val_metrics={},val_score=0.42)
+        self.client.force_login(self.u);response=self.client.get(f'/contests/{self.c.pk}/submissions/')
+        self.assertContains(response,'RMSE: 0.420000 (순위)');self.assertContains(response,'MAE: —')
+
+class DeletionTests(Fixtures, TestCase):
+    def operator(self):
+        self.other.is_staff=True;self.other.is_superuser=True;self.other.save()
+        device=TOTPDevice.objects.create(user=self.other,name='test',confirmed=True)
+        self.client.force_login(self.other);session=self.client.session;session['otp_device_id']=device.persistent_id;session.save()
+    def folders(self,problem):
+        return [Path(self.tmp.name)/prefix/str(problem.pk) for prefix in ('originals','student')]
+    def test_contest_without_submissions_is_removed_with_files_and_audited(self):
+        Announcement.objects.create(contest=self.c,title='t',body='b')
+        self.assertTrue(all(f.is_dir() for f in self.folders(self.p)))
+        with self.captureOnCommitCallbacks(execute=True):services.delete_contest(self.c.pk,self.other)
+        for model in (Contest,Problem,Membership,Announcement):self.assertFalse(model.objects.exists(),model)
+        self.assertFalse(any(f.exists() for f in self.folders(self.p)));self.assertTrue(Semester.objects.filter(pk=self.semester.pk).exists())
+        self.assertTrue(Audit.objects.filter(action='대회 삭제',actor=self.other,detail__contains='문제 1개 · 참가 신청 1건 · 공지 1건').exists())
+    def test_contest_with_submissions_is_protected(self):
+        s=self.accept()
+        with self.assertRaisesMessage(ValidationError,'제출이 있는 대회'):services.delete_contest(self.c.pk,self.other)
+        self.assertTrue(Contest.objects.filter(pk=self.c.pk).exists());self.assertTrue(all(f.is_dir() for f in self.folders(self.p)))
+        with self.assertRaisesMessage(ValidationError,'제출이 있는 문제'):services.delete_problem(self.p.pk,self.other)
+        self.assertTrue(Submission.objects.filter(pk=s.pk).exists())
+    def test_problem_deletion_rules(self):
+        p2=Problem.objects.create(contest=self.c,title='실수',kind='binary',metric='roc_auc',description='d',units='u',source='s',split_method='m')
+        services.prepare_data(p2.pk,self.files,None)
+        with self.captureOnCommitCallbacks(execute=True):services.delete_problem(p2.pk,self.other)
+        self.assertFalse(Problem.objects.filter(pk=p2.pk).exists());self.assertFalse(any(f.exists() for f in self.folders(p2)))
+        self.assertTrue(all(f.is_dir() for f in self.folders(self.p)))  # sibling problem untouched
+        self.finish()
+        with self.assertRaisesMessage(ValidationError,'종료된 대회'):services.delete_problem(self.p.pk,self.other)
+    def test_admin_delete_button_follows_the_rule(self):
+        self.operator();change=f'/admin/arena/contest/{self.c.pk}/change/';delete=f'/admin/arena/contest/{self.c.pk}/delete/'
+        response=self.client.get(change);self.assertContains(response,'삭제 가능');self.assertContains(response,delete)
+        self.assertNotContains(self.client.get('/admin/arena/contest/'),'delete_selected')
+        response=self.client.get(delete);self.assertEqual(response.status_code,200);self.assertContains(response,'참가 신청 1')
+        self.accept()  # a student submits while the confirmation page is open
+        self.assertEqual(self.client.post(delete,{'post':'yes'}).status_code,403)
+        from arena.admin import ContestAdmin
+        with patch.object(ContestAdmin,'deletable',return_value=True):  # permission passed just before the submission landed
+            response=self.client.post(delete,{'post':'yes'});self.assertRedirects(response,change,fetch_redirect_response=False)
+        self.assertTrue(Contest.objects.filter(pk=self.c.pk).exists())
+        response=self.client.get(change);self.assertContains(response,'제출이 있는 대회');self.assertContains(response,'삭제 불가 · 제출 1건')
+        self.assertNotContains(response,f'href="{delete}"');self.assertEqual(self.client.get(delete).status_code,403)
+        self.assertNotContains(self.client.get('/ops/'),delete)
+    def test_admin_delete_requires_model_permission(self):
+        from django.contrib.auth.models import Permission
+        ta=User.objects.create_user(username='ta',password='strong-password',real_name='조교',student_id='9',nickname='ta',is_staff=True)
+        ta.user_permissions.add(*Permission.objects.filter(content_type__app_label='arena').exclude(codename__startswith='delete_'))
+        device=TOTPDevice.objects.create(user=ta,name='test',confirmed=True)
+        self.client.force_login(ta);session=self.client.session;session['otp_device_id']=device.persistent_id;session.save()
+        change=f'/admin/arena/contest/{self.c.pk}/change/';delete=f'/admin/arena/contest/{self.c.pk}/delete/'
+        response=self.client.get(change);self.assertEqual(response.status_code,200);self.assertNotContains(response,f'href="{delete}"')
+        self.assertEqual(self.client.get(delete).status_code,403);self.assertEqual(self.client.post(delete,{'post':'yes'}).status_code,403)
+        self.assertTrue(Contest.objects.filter(pk=self.c.pk).exists())
+    def test_submission_during_deletion_is_refused_not_500(self):
+        def delete_contest_meanwhile(problem,raw):services.delete_contest(self.c.pk,self.other)
+        with patch('arena.services.check_scorable',side_effect=delete_contest_meanwhile):
+            with self.assertRaisesMessage(ValidationError,'삭제'):self.accept()
+        self.assertEqual(Submission.objects.count(),0);self.assertFalse(list(Path(self.tmp.name).rglob('submissions/*/*.csv')))
+        c2=Contest.objects.create(semester=self.semester,title='둘',description='d',opens_at=timezone.now()-timedelta(days=1),closes_at=timezone.now()+timedelta(days=1),invite_code='B',visible=True)
+        p2=Problem.objects.create(contest=c2,title='p',kind='regression',metric='rmse',description='d',units='u',source='s',split_method='m')
+        services.prepare_data(p2.pk,self.files,None);services.publish_problem(p2.pk,None);p2.refresh_from_db()
+        Membership.objects.create(user=self.u,contest=c2,student_id=self.u.student_id,status='approved')
+        def delete_problem_meanwhile(problem,raw):services.delete_problem(p2.pk,self.other)
+        with patch('arena.services.check_scorable',side_effect=delete_problem_meanwhile):
+            with self.assertRaisesMessage(ValidationError,'삭제'):services.accept_submission(self.u,p2,self.raw,uuid.uuid4(),timezone.now())
+        self.assertEqual(Submission.objects.count(),0)
+    def test_admin_deletes_an_unused_contest(self):
+        self.operator()
+        c2=Contest.objects.create(semester=self.semester,title='시험용',description='d',opens_at=timezone.now(),closes_at=timezone.now()+timedelta(days=1),invite_code='TMP')
+        p2=Problem.objects.create(contest=c2,title='p',kind='regression',metric='mae',description='d',units='u',source='s',split_method='m')
+        services.prepare_data(p2.pk,self.files,None)
+        self.assertContains(self.client.get('/ops/'),f'/admin/arena/contest/{c2.pk}/delete/')
+        with self.captureOnCommitCallbacks(execute=True):
+            response=self.client.post(f'/admin/arena/contest/{c2.pk}/delete/',{'post':'yes'})
+        self.assertEqual(response.status_code,302);self.assertFalse(Contest.objects.filter(pk=c2.pk).exists())
+        self.assertFalse(any(f.exists() for f in self.folders(p2)));self.assertTrue(all(f.is_dir() for f in self.folders(self.p)))
+        self.assertTrue(Audit.objects.filter(action='대회 삭제',detail__contains='시험용').exists())
+        response=self.client.get(f'/admin/arena/problem/{self.p.pk}/change/');self.assertContains(response,'삭제 가능')
+        with self.captureOnCommitCallbacks(execute=True):
+            self.assertEqual(self.client.post(f'/admin/arena/problem/{self.p.pk}/delete/',{'post':'yes'}).status_code,302)
+        self.assertFalse(Problem.objects.filter(pk=self.p.pk).exists());self.assertTrue(Audit.objects.filter(action='문제 삭제').exists())
+
+class BackfillMetricsCommandTests(Fixtures, TestCase):
+    def test_fills_details_without_touching_scores(self):
+        from io import StringIO
+        from django.core.management import call_command
+        s=self.accept();grade(str(s.pk))
+        Submission.objects.filter(pk=s.pk).update(val_metrics={},scorer_version='chembig-1')
+        stale=self.accept(self.raw.replace(b'val_001,0',b'val_001,2'));grade(str(stale.pk))
+        Submission.objects.filter(pk=stale.pk).update(val_metrics={},val_score=123.0)  # stored score no longer reproducible
+        out,err=StringIO(),StringIO()
+        call_command('backfill_metrics','--dry-run',stdout=out,stderr=err)
+        s.refresh_from_db();self.assertEqual(s.val_metrics,{});self.assertIn('보충 1건',out.getvalue());self.assertIn('건너뜀 1건',out.getvalue())
+        call_command('backfill_metrics',stdout=out,stderr=err)
+        s.refresh_from_db();stale.refresh_from_db()
+        self.assertEqual(s.val_score,0);self.assertEqual(s.scorer_version,'chembig-1');self.assertEqual(s.val_metrics['rmse'],0);self.assertAlmostEqual(s.val_metrics['r2'],1)
+        self.assertEqual(s.test_metrics,{})
+        self.assertEqual((stale.val_score,stale.val_metrics),(123.0,{}));self.assertIn(str(stale.pk),err.getvalue())
+        self.assertTrue(Audit.objects.filter(action__contains='backfill_metrics').exists())
+        self.finish();services.finalize(self.c.pk);s.refresh_from_db();self.assertEqual(s.test_metrics['rmse'],0)
+
+class CreateContestCommandTests(Fixtures, TestCase):
+    def test_spec_creates_publishes_and_scores(self):
+        import json
+        from django.core.management import call_command
+        folder=Path(self.tmp.name)/'spec';folder.mkdir()
+        for split,raw in self.files.items():(folder/f'{split}.csv').write_bytes(raw)
+        spec={'semester':{'year':2030,'term':'1학기'},'contest':{'title':'TDC 테스트','description':'d','rules':'r',
+            'opens_at':'2030-01-01T00:00:00+09:00','closes_at':'2030-12-04T23:59:59+09:00','daily_limit':3,'invite_code':'TDC-1','visible':True},
+            'problems':[{'title':'BBBP','kind':'binary','metric':'roc_auc','description':'d','units':'u','source':'s','split_method':'m',
+                'files':{'train':'train.csv','val':'val.csv','test':'test.csv'},'publish':True}]}
+        (folder/'spec.json').write_text(json.dumps(spec,ensure_ascii=False),encoding='utf-8')
+        call_command('create_contest',str(folder/'spec.json'))
+        c=Contest.objects.get(title='TDC 테스트');p=c.problems.get()
+        self.assertEqual(timezone.localtime(c.closes_at).strftime('%Y-%m-%d %H:%M:%S'),'2030-12-04 23:59:59')
+        self.assertEqual(c.daily_limit,3);self.assertTrue(c.visible);self.assertIsNotNone(p.published_at)
+        self.assertEqual(p.manifest['train']['rows'],2);self.assertEqual(p.metric,'roc_auc');self.assertTrue(Audit.objects.filter(action__contains='create_contest').exists())
+        Membership.objects.create(user=self.u,contest=c,student_id=self.u.student_id,status='approved')
+        s=services.accept_submission(self.u,p,self.raw,uuid.uuid4(),c.opens_at);grade(str(s.pk));s.refresh_from_db();self.assertEqual(s.val_score,1)
+        from django.core.management.base import CommandError
+        with self.assertRaises(CommandError):call_command('create_contest',str(folder/'spec.json'))
+        spec['problems'][0]['metric']='rmse';(folder/'spec.json').write_text(json.dumps(spec),encoding='utf-8')
+        with self.assertRaises(CommandError):call_command('create_contest',str(folder/'spec.json'),'--contest-id',str(c.pk))
+        self.assertEqual(c.problems.count(),1)
+    def test_failed_spec_leaves_no_files_or_rows(self):
+        import json
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+        folder=Path(self.tmp.name)/'spec';folder.mkdir()
+        for split,raw in self.files.items():(folder/f'{split}.csv').write_bytes(raw)
+        good={'title':'A','kind':'binary','metric':'roc_auc','description':'d','units':'u','source':'s','split_method':'m',
+            'files':{'train':'train.csv','val':'val.csv','test':'test.csv'},'publish':True}
+        spec={'semester':{'year':2031,'term':'1학기'},'contest':{'title':'실패','description':'d','rules':'r','opens_at':'2031-01-01T00:00:00+09:00',
+            'closes_at':'2031-12-04T23:59:59+09:00','invite_code':'X'},'problems':[good,{**good,'title':'B','metric':'rmse'}]}
+        files_before=sorted(str(f) for f in Path(self.tmp.name).rglob('*.csv'))
+        def run():
+            (folder/'spec.json').write_text(json.dumps(spec,ensure_ascii=False),encoding='utf-8')
+            call_command('create_contest',str(folder/'spec.json'))
+        with self.assertRaises(CommandError):run()  # second problem fails full_clean before anything is written
+        spec['problems'].pop()
+        with patch('arena.management.commands.create_contest.publish_problem',side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):run()  # failure after prepare_data wrote files: they must be removed again
+        self.assertFalse(Contest.objects.filter(title='실패').exists());self.assertEqual(Problem.objects.exclude(pk=self.p.pk).count(),0)
+        self.assertEqual(sorted(str(f) for f in Path(self.tmp.name).rglob('*.csv')),files_before)
+        spec['contest']['opens_at']=None
+        with self.assertRaisesMessage(CommandError,'ISO 8601'):run()
+        spec['contest']['opens_at']=1760000000
+        with self.assertRaisesMessage(CommandError,'ISO 8601'):run()
+        spec['contest']['opens_at']='2031-01-01T00:00:00+09:00';spec['contest']['name']=spec['contest'].pop('title')
+        with self.assertRaisesMessage(CommandError,'contest.title'):run()

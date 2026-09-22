@@ -5,8 +5,8 @@ from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 from django.conf import settings
-from .models import Submission
-from .services import disk_path, evaluate, dispatch
+from .models import Submission, AuthAttempt
+from .services import disk_path, evaluate_all, dispatch
 logger = logging.getLogger(__name__)
 
 @shared_task
@@ -20,10 +20,15 @@ def grade(sid):
         s.save(update_fields=['status','lease','started_at','attempts'])
     try:
         s = Submission.objects.select_related('problem').get(pk=sid)
-        if s.dataset_version != s.problem.dataset_version or s.scorer_version != settings.SCORER_VERSION:
-            raise RuntimeError('Version mismatch')
-        value = evaluate(s.problem, disk_path(s.path).read_bytes(), 'val')
-        Submission.objects.filter(pk=sid, status='processing', lease=token).update(status='scored', val_score=value, error='', lease=None)
+        if s.dataset_version != s.problem.dataset_version:
+            raise RuntimeError('Dataset version mismatch')
+        # The scorer version is stamped at grading time: a SCORER_VERSION bump must not strand pending submissions
+        # in 'error' (4 attempts each, quota refund, operator retry). The change of scorer is still visible in the log.
+        if s.scorer_version != settings.SCORER_VERSION:
+            logger.warning('Submission %s accepted under scorer %s, grading under %s', sid, s.scorer_version, settings.SCORER_VERSION)
+        value, details = evaluate_all(s.problem, disk_path(s.path).read_bytes(), 'val')
+        Submission.objects.filter(pk=sid, status='processing', lease=token).update(
+            status='scored', val_score=value, val_metrics=details, error='', lease=None, scorer_version=settings.SCORER_VERSION)
     except Exception:
         logger.exception('Scoring failed for submission %s', sid)
         status = 'pending' if s.attempts < 4 else 'error'
@@ -42,3 +47,5 @@ def reconcile():
             s.error = '작업 중단으로 재처리가 필요합니다.'
             s.save(update_fields=['status','lease','error','quota_exempt'])
     for sid in Submission.objects.filter(status='pending').values_list('pk', flat=True): dispatch(sid)
+    # Login-throttle counters only matter inside their 15-minute window; drop stale rows so the table stays bounded.
+    AuthAttempt.objects.filter(window_start__lt=timezone.now()-timedelta(days=1)).delete()

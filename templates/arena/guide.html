@@ -4,6 +4,7 @@ val_002,0.73
 test_001,0.68
 test_002,0.19</pre><p class="prose-text mt-4">sample_submission.csv를 내려받아 prediction 열을 채우세요. sample_id는 문자열로 유지합니다. 엑셀로 열 때 앞자리 0이 사라지지 않게 주의하세요.
 행 순서는 상관없지만 누락·중복·추가 ID는 허용하지 않습니다. 빈 값, NaN, Infinity는 제출할 수 없습니다. 파일은 UTF-8 CSV, 최대 10MB입니다.
-이진분류는 양성 클래스의 확률(0~1), 회귀는 문제 설명에 지정된 단위로 예측합니다.</p><h3>점수와 순위</h3><p class="prose-text">RMSE·MAE는 낮을수록, ROC-AUC·Average Precision은 높을수록 좋습니다. 진행 중에는 최고 val 점수로 순위를 보여 줍니다.
+이진분류는 양성 클래스의 확률(0~1), 회귀는 문제 설명에 지정된 단위로 예측합니다.</p><h3>점수와 순위</h3><p class="prose-text">문제마다 순위 지표 하나가 정해져 있습니다. 회귀는 RMSE·MAE·MSE(낮을수록 좋음)와 R²·Pearson r·Spearman ρ(높을수록 좋음), 이진분류는 ROC-AUC·AUPRC·Accuracy·Balanced Accuracy·F1·MCC·Precision·Recall·Specificity(높을수록 좋음)와 Log Loss(낮을수록 좋음)를 지원합니다.
+제출마다 같은 유형의 모든 지표를 함께 계산해 내 제출과 순위표에 참고값으로 보여 줍니다. 분류의 라벨 지표는 제출한 확률을 0.5 기준으로 나눠 계산합니다. 진행 중에는 최고 val 점수로 순위를 보여 줍니다.
 최종 지정이 없으면 최고 val 제출을 자동 선택합니다. 마감 전에 접수된 채점이 모두 끝난 뒤 test로 최종 채점합니다. 관리자가 공개할 때까지 test 점수는 보이지 않습니다.
 동점은 반올림 전 점수, 빠른 서버 접수 시각 순입니다. 모든 일정과 일일 한도는 한국 시간 기준입니다.</p></div><aside><div class="panel"><h3>제출 횟수</h3><p class="text-sm muted">기본 학생·문제별 하루 5회입니다. 대회 규칙에 지정된 한도를 따릅니다. 형식 오류와 서버 오류는 제외되며 채점 대기 제출은 포함됩니다.</p></div><div class="panel"><h3>비밀번호를 잊었다면</h3><p class="text-sm muted">교수자에게 기존 수업 연락 수단으로 본인 확인을 요청하세요. 전달받은 코드는 30분 동안 한 번 사용할 수 있습니다.</p><a class="btn light small mt-4" href="{% url 'recover' %}">계정 복구 →</a></div></aside></div>{% endblock %}
