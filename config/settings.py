@@ -65,7 +65,7 @@ CELERY_TASK_TIME_LIMIT = 240
 CELERY_TASK_SOFT_TIME_LIMIT = 210
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_BROKER_TRANSPORT_OPTIONS = {'visibility_timeout': 300}
-SCORER_VERSION = 'chembig-2'  # bump whenever metric definitions change
+SCORER_VERSION = 'chembig-3'  # bump whenever metric definitions change (chembig-3: Precision relabelled PPV, NPV added)
 # Django's default logging is silent in production: its console handler requires DEBUG and mail_admins has no
 # ADMINS here, so 500 tracebacks were dropped. Write request errors and application logs to stdout for `docker compose logs`.
 LOGGING = {

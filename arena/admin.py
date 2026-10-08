@@ -88,10 +88,20 @@ class ProblemAdmin(ServiceDeleteMixin,AuditedAdmin):
 
 @admin.register(Membership)
 class MembershipAdmin(AuditedAdmin):
-    list_display=['user','contest','student_id','status']
+    list_display=['user','contest','student_id','status','created_at']
     list_filter=['contest','status']
+    search_fields=['user__username','user__real_name','student_id']
     readonly_fields=['user','contest','student_id','status']
+    list_per_page=200
+    actions=['approve_selected','suspend_selected']  # the changelist has select-all; status changes go through the service
     def has_add_permission(self,request): return False
+    @admin.action(description='선택한 참가자 승인',permissions=['change'])
+    def approve_selected(self,request,queryset): self._set_status(request,queryset,'approved')
+    @admin.action(description='선택한 참가자 정지',permissions=['change'])
+    def suspend_selected(self,request,queryset): self._set_status(request,queryset,'suspended')
+    def _set_status(self,request,queryset,state):
+        changed=services.set_membership_status(queryset.values_list('pk',flat=True),state,request.user)
+        self.message_user(request,f'참가자 {changed}명을 {dict(Membership.STATUS)[state]} 상태로 변경했습니다. 종료된 대회와 이미 같은 상태인 참가자는 제외됩니다.',messages.SUCCESS)
 
 @admin.register(Submission)
 class SubmissionAdmin(admin.ModelAdmin):

@@ -66,3 +66,5 @@ sudo --preserve-env=COMPOSE_FILE,COMPOSE_PROJECT_NAME,COMPOSE_ENV_FILES scripts/
 ```
 
 정리할 때 동일 Compose 환경변수를 유지하고 `docker compose down`을 실행합니다. `compose.test.yaml` 테스트 프로젝트는 `docker compose -f compose.test.yaml down`으로 정리합니다. 운영 데이터를 자동 삭제하는 명령은 포함하지 않습니다.
+
+2026-10-08: 참가 신청 일괄 처리(운영 화면 전체 선택 확인란, 관리자 목록의 승인·정지 일괄 작업, 공통 `services.set_membership_status`)와 분류 지표 Precision(PPV) 표기·NPV 추가(채점기 `chembig-3`, 마이그레이션 0004). NPV는 0.5 임계값으로 음성 예측 중 실제 음성의 비율이며 음성 예측이 없으면 0입니다.

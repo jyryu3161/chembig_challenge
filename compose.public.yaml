@@ -5,14 +5,14 @@ services:
     image: chembig:public-8502
     environment:
       DEBUG: '0'
-      DJANGO_SETTINGS_MODULE: config.http_preview
-      ALLOWED_HOSTS: 52.78.201.155,localhost,127.0.0.1
-      CSRF_TRUSTED_ORIGINS: http://52.78.201.155:8502
+      DJANGO_SETTINGS_MODULE: config.settings
+      ALLOWED_HOSTS: chemprop.csblab.net,52.78.201.155,localhost,127.0.0.1
+      CSRF_TRUSTED_ORIGINS: https://chemprop.csblab.net
   worker:
     image: chembig:public-8502
     environment:
       DEBUG: '0'
-      DJANGO_SETTINGS_MODULE: config.http_preview
-      ALLOWED_HOSTS: 52.78.201.155,localhost,127.0.0.1
+      DJANGO_SETTINGS_MODULE: config.settings
+      ALLOWED_HOSTS: chemprop.csblab.net,52.78.201.155,localhost,127.0.0.1
   nginx:
-    ports: !override ['0.0.0.0:8502:80']
+    ports: !override ['172.20.0.1:8502:80']

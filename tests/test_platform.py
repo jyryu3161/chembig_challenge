@@ -281,6 +281,30 @@ class AccessTests(Fixtures, TestCase):
         response=self.client.post('/ops/approve/',{'state':'suspended','members':['abc','','\u00b2','\u2460',str(self.m.pk)]})
         self.assertEqual(response.status_code,302);self.m.refresh_from_db();self.assertEqual(self.m.status,'suspended')
         self.assertEqual(self.client.get(f'/contests/{self.c.pk}/leaderboard/?problem=\u00b2').status_code,200)  # as the operator
+    def test_bulk_status_change_skips_unchanged_and_ended(self):
+        before=Audit.objects.count()
+        self.assertEqual(services.set_membership_status([self.m.pk],'approved',self.other),0)  # already approved: no audit noise
+        self.assertEqual(Audit.objects.count(),before)
+        self.assertEqual(services.set_membership_status([self.m.pk],'suspended',self.other),1);self.m.refresh_from_db();self.assertEqual(self.m.status,'suspended')
+        self.assertEqual(Audit.objects.count(),before+1)
+        self.finish()
+        self.assertEqual(services.set_membership_status([self.m.pk],'approved',self.other),0);self.m.refresh_from_db();self.assertEqual(self.m.status,'suspended')
+        with self.assertRaises(ValueError):services.set_membership_status([self.m.pk],'deleted',self.other)
+    def test_operator_can_select_all_members_on_ops_page_and_in_admin(self):
+        self.other.is_staff=True;self.other.is_superuser=True;self.other.save()
+        device=TOTPDevice.objects.create(user=self.other,name='test',confirmed=True)
+        self.client.force_login(self.other);session=self.client.session;session['otp_device_id']=device.persistent_id;session.save()
+        pending=Membership.objects.create(user=self.other,contest=self.c,student_id='0002',status='pending')
+        response=self.client.get('/ops/');self.assertContains(response,'id="select-all-members"');self.assertContains(response,'input[name=members]')
+        response=self.client.post('/ops/approve/',{'state':'approved','members':[str(self.m.pk),str(pending.pk)]})
+        self.assertRedirects(response,'/ops/',fetch_redirect_response=False);pending.refresh_from_db();self.assertEqual(pending.status,'approved')
+        self.assertContains(self.client.get('/ops/'),'참가자 1명의 상태를 변경했습니다')
+        response=self.client.get('/admin/arena/membership/');self.assertContains(response,'action-toggle');self.assertContains(response,'approve_selected')
+        response=self.client.post('/admin/arena/membership/',{'action':'suspend_selected','_selected_action':[str(self.m.pk),str(pending.pk)],'index':'0'})
+        self.assertEqual(response.status_code,302);self.m.refresh_from_db();pending.refresh_from_db()
+        self.assertEqual((self.m.status,pending.status),('suspended','suspended'))
+        self.assertContains(self.client.get('/admin/arena/membership/'),'참가자 2명을 참가 정지 상태로 변경했습니다')
+        self.assertEqual(Audit.objects.filter(action='참가 suspended').count(),2)
     def test_duplicate_student_join(self):
         self.other.student_id=self.u.student_id;self.other.save();self.client.force_login(self.other)
         self.client.post(f'/contests/{self.c.pk}/join/',{'invite_code':'CODE'})
@@ -368,7 +392,7 @@ class MetricRegistryTests(Fixtures, TestCase):
         from arena.scoring import REGISTRY, metrics_for, score_all
         self.assertEqual({m.kind for m in REGISTRY.values()}, {'regression','binary'})
         self.assertEqual({m.key for m in metrics_for('regression')}, {'rmse','mae','mse','r2','pearson','spearman'})
-        self.assertEqual({m.key for m in metrics_for('binary')}, {'roc_auc','ap','log_loss','accuracy','balanced_accuracy','f1','mcc','precision','recall','specificity'})
+        self.assertEqual({m.key for m in metrics_for('binary')}, {'roc_auc','ap','log_loss','accuracy','balanced_accuracy','f1','mcc','precision','npv','recall','specificity'})
         self.assertEqual(set(score_all('regression',[1,2,3],[1,2,3])), {m.key for m in metrics_for('regression')})
         self.assertEqual(set(score_all('binary',[0,1],[.2,.8])), {m.key for m in metrics_for('binary')})
     def test_regression_metric_values(self):
@@ -383,6 +407,8 @@ class MetricRegistryTests(Fixtures, TestCase):
         y,p=[0,0,1,1],[.1,.6,.4,.9]
         self.assertAlmostEqual(score('accuracy',y,p),0.5);self.assertAlmostEqual(score('precision',y,p),0.5)
         self.assertAlmostEqual(score('recall',y,p),0.5);self.assertAlmostEqual(score('specificity',y,p),0.5)
+        self.assertAlmostEqual(score('npv',y,p),0.5)  # predicted negatives: one true negative, one false negative
+        self.assertAlmostEqual(score('npv',[0,0,1,1],[.1,.2,.3,.9]),2/3);self.assertEqual(score('npv',[0,1],[.9,.9]),0)  # no predicted negative → 0
         self.assertAlmostEqual(score('f1',y,p),0.5);self.assertAlmostEqual(score('balanced_accuracy',y,p),0.5);self.assertAlmostEqual(score('mcc',y,p),0)
         self.assertAlmostEqual(score('roc_auc',y,p),0.75);self.assertGreater(score('log_loss',y,p),0)
         self.assertTrue(math.isfinite(score('log_loss',[0,1],[0,1])))
@@ -421,7 +447,7 @@ class MetricRegistryTests(Fixtures, TestCase):
         self.assertEqual(s.val_score,1);self.assertEqual(s.val_metrics['accuracy'],1);self.assertEqual(s.val_metrics['mcc'],1);self.assertEqual(s.val_metrics['specificity'],1)
         self.client.force_login(self.u)
         response=self.client.get(f'/contests/{self.c.pk}/leaderboard/?problem={p.pk}')
-        for label in ['AUPRC (Average Precision)','ROC-AUC','Balanced Accuracy','Specificity','Log Loss']:self.assertContains(response,label)
+        for label in ['AUPRC (Average Precision)','ROC-AUC','Balanced Accuracy','Specificity','Log Loss','Precision (PPV)','NPV (Negative Predictive Value)']:self.assertContains(response,label)
         response=self.client.get(f'/contests/{self.c.pk}/submissions/')
         self.assertContains(response,'세부 지표');self.assertContains(response,'MCC')
         self.assertNotContains(response,'test_metrics')

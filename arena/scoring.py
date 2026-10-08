@@ -76,7 +76,8 @@ REGISTRY = {m.key: m for m in [
     Metric('balanced_accuracy', 'Balanced Accuracy', 'binary', False, lambda y, p: float(skm.balanced_accuracy_score(y, _labels(p))), '임계값 0.5'),
     Metric('f1', 'F1', 'binary', False, lambda y, p: float(skm.f1_score(y, _labels(p), zero_division=0)), '임계값 0.5'),
     Metric('mcc', 'MCC', 'binary', False, lambda y, p: float(skm.matthews_corrcoef(y, _labels(p))), '임계값 0.5'),
-    Metric('precision', 'Precision', 'binary', False, lambda y, p: float(skm.precision_score(y, _labels(p), zero_division=0)), '임계값 0.5'),
+    Metric('precision', 'Precision (PPV)', 'binary', False, lambda y, p: float(skm.precision_score(y, _labels(p), zero_division=0)), '임계값 0.5'),
+    Metric('npv', 'NPV (Negative Predictive Value)', 'binary', False, lambda y, p: float(skm.precision_score(y, _labels(p), pos_label=0, zero_division=0)), '임계값 0.5'),
     Metric('recall', 'Recall (Sensitivity)', 'binary', False, lambda y, p: float(skm.recall_score(y, _labels(p), zero_division=0)), '임계값 0.5'),
     Metric('specificity', 'Specificity', 'binary', False, lambda y, p: float(skm.recall_score(y, _labels(p), pos_label=0, zero_division=0)), '임계값 0.5'),
 ]}

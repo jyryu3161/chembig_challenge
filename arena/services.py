@@ -252,6 +252,23 @@ def retry_submission(sid, actor):
     transaction.on_commit(lambda: dispatch(s.pk))
 
 
+@transaction.atomic
+def set_membership_status(pks, state, actor):
+    """Approve or suspend memberships in bulk (operations page and admin actions).
+
+    Memberships of ended contests and rows already in `state` are skipped, so a select-all over the whole
+    list is safe and leaves one audit row per membership that actually changed. Returns that count."""
+    if state not in ('approved', 'suspended'): raise ValueError('Unknown membership state')
+    changed = 0
+    rows = Membership.objects.select_for_update().filter(pk__in=list(pks), contest__closes_at__gt=timezone.now()).exclude(status=state)
+    for m in rows:
+        m.status = state
+        m.save(update_fields=['status'])
+        audit(actor, '참가 ' + state, f'{m.contest_id}/{m.user_id}')
+        changed += 1
+    return changed
+
+
 # Deletion. Every foreign key is PROTECT and the admin hides the ORM delete on purpose: graded work is never removed.
 # The one legitimate case is a contest or problem that never received a submission (a test run, a wrong spec).
 def contest_deletable(contest):

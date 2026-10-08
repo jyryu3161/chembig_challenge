@@ -236,13 +236,8 @@ def approve(request):
     state = request.POST.get('state')
     if state not in ['approved','suspended']: raise Http404
     selected = [pk for pk in map(pk_or_none, request.POST.getlist('members')) if pk is not None]
-    with transaction.atomic():
-        qs = Membership.objects.select_for_update().filter(pk__in=selected, contest__closes_at__gt=timezone.now())
-        for m in qs:
-            m.status=state
-            m.save(update_fields=['status'])
-            services.audit(request.user,'참가 '+state,f'{m.contest_id}/{m.user_id}')
-    messages.success(request,'선택한 참가자의 상태를 변경했습니다. 종료된 대회는 제외됩니다.')
+    changed = services.set_membership_status(selected, state, request.user)
+    messages.success(request,f'참가자 {changed}명의 상태를 변경했습니다. 종료된 대회와 이미 같은 상태인 참가자는 제외됩니다.')
     return redirect('operations')
 
 
