@@ -78,6 +78,8 @@ Redis를 재시작하거나 작업자를 재시작한 뒤 `docker compose exec w
 
 세부 지표 도입(`chembig-2`) 이전에 채점된 제출은 순위 점수만 있고 `세부 지표`가 비어 있습니다. `docker compose exec web python manage.py backfill_metrics --dry-run`으로 대상을 확인한 뒤 `--dry-run`을 빼고 실행하면 저장된 파일로 나머지 지표만 계산해 채웁니다. 저장된 순위 점수는 절대 바꾸지 않으며, 재계산 값이 저장 점수와 다르면 그 제출은 건너뛰고 표준 오류에 보고합니다.
 
+게시된 문제의 순위 지표는 관리자 폼에서 잠겨 있습니다. 저장된 순위 점수가 지표 값의 복사본이라 폼에서 바꾸면 점수와 어긋나기 때문입니다. 진행 중에 바꿔야 하면 `docker compose exec web python manage.py change_metric <문제 ID> <지표 키> --actor <관리자 username>`을 실행합니다. 채점 완료된 모든 제출의 순위 점수를 세부 지표의 해당 값으로 다시 쓰고 작업 기록에 남깁니다. 세부 지표에 새 지표 값이 없는 제출이 있으면 거부하므로 먼저 `backfill_metrics`를 실행하세요(빈 세부 지표뿐 아니라 빠진 키도 보충합니다). 최종 채점이 확정된 대회는 바꿀 수 없습니다. 학생이 직접 지정한 최종 제출은 유지되므로, 지표를 바꾸면 최종 제출을 다시 확인하라고 안내하세요.
+
 ## 백업과 별도 PC 사본
 
 `scripts/backup.sh`는 DB의 일관된 pg_dump를 먼저 저장하고 불변 데이터·학생용 파일·제출을 압축합니다. 각각의 SHA-256과 이미지 정보를 manifest에 기록하고 완료 후에만 성공 시각을 갱신합니다. 최근 30일을 유지합니다. 같은 서버 백업은 서버 자체 손실을 막지 못합니다.
@@ -126,4 +128,4 @@ docker compose exec web python manage.py create_contest /tmp/bbbp/spec.json --ac
 
 TDC ADMET 벤치마크 과제는 `scripts/fetch_tdc.py`로 변환합니다. PyTDC는 플랫폼 의존성이 아니므로 별도 가상환경에서 실행합니다 (설치 명령은 스크립트 상단 주석). 예: `python scripts/fetch_tdc.py BBB_Martins --out var/imports/bbbp` 는 TDC가 고정한 scaffold-split test 집합과 seed 1 train/valid 분할을 `train.csv`·`val.csv`·`test.csv`와 `spec.json` 초안으로 저장합니다. 행 순서는 섞고 ID는 `train_0001` 형식으로 다시 부여하므로 정답 정보가 새지 않습니다. 초대 코드·기간·설명을 수정한 뒤 `create_contest`로 등록하세요.
 
-현재 8502 서비스에는 2026년 2학기 `TDC ADMET 벤치마크 · BBBP 혈액뇌장벽 투과 예측` 대회(마감 2026-12-04 23:59:59 KST, 순위 지표 ROC-AUC)가 이 절차로 등록되어 있습니다. 초대 코드는 `/admin/arena/contest/`에서 확인합니다.
+현재 8502 서비스에는 2026년 2학기 `BBBP 혈액뇌장벽 투과 예측` 대회(마감 2026-12-04 23:59:59 KST, 순위 지표 MCC · 2026-10-13에 ROC-AUC에서 변경, 제목도 같은 날 `TDC ADMET 벤치마크 ·` 접두를 뺌)가 이 절차로 등록되어 있습니다. 초대 코드는 `/admin/arena/contest/`에서 확인합니다.

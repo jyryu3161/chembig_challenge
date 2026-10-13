@@ -1,6 +1,7 @@
 import math
 import re
 import tempfile
+from io import StringIO
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -10,6 +11,8 @@ from django.conf import settings
 from django.contrib.sessions.models import Session
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.db import connection, close_old_connections
 from django.test import TestCase, TransactionTestCase, Client, override_settings
 from django.utils import timezone
@@ -643,6 +646,49 @@ class BackfillMetricsCommandTests(Fixtures, TestCase):
         self.assertEqual((stale.val_score,stale.val_metrics),(123.0,{}));self.assertIn(str(stale.pk),err.getvalue())
         self.assertTrue(Audit.objects.filter(action__contains='backfill_metrics').exists())
         self.finish();services.finalize(self.c.pk);s.refresh_from_db();self.assertEqual(s.test_metrics['rmse'],0)
+
+class ChangeMetricTests(Fixtures, TestCase):
+    """Switching a published problem's ranking metric re-derives stored scores; the admin form stays locked."""
+    FLAT=b'sample_id,prediction\nval_001,1\nval_002,1\ntest_001,1\ntest_002,1\n'
+    def setUp(self):
+        super().setUp()
+        self.b=Problem.objects.create(contest=self.c,title='분류',kind='binary',metric='roc_auc',description='양성 확률',units='확률',source='합성',split_method='고정')
+        services.prepare_data(self.b.pk,self.files,None);services.publish_problem(self.b.pk,None);self.b.refresh_from_db()
+        self.good=services.accept_submission(self.u,self.b,self.raw,uuid.uuid4(),timezone.now());grade(str(self.good.pk));self.good.refresh_from_db()
+        self.flat=services.accept_submission(self.u,self.b,self.FLAT,uuid.uuid4(),timezone.now());grade(str(self.flat.pk));self.flat.refresh_from_db()
+        self.assertEqual((self.good.val_score,self.flat.val_score),(1.0,0.5))
+    def test_change_recomputes_scores_leaderboard_and_final_choice(self):
+        self.assertEqual(services.change_ranking_metric(self.b.pk,'mcc',self.other),2)
+        self.b.refresh_from_db();self.good.refresh_from_db();self.flat.refresh_from_db()
+        self.assertEqual(self.b.metric,'mcc');self.assertEqual((self.good.val_score,self.flat.val_score),(1.0,0.0))
+        self.assertEqual((self.good.val_metrics['roc_auc'],self.flat.val_metrics['roc_auc']),(1.0,0.5))  # details untouched
+        self.assertTrue(Audit.objects.filter(action='순위 지표 변경',actor=self.other,detail__contains='roc_auc → mcc · 제출 2건').exists())
+        self.client.force_login(self.u);response=self.client.get(f'/contests/{self.c.pk}/leaderboard/?problem={self.b.pk}')
+        self.assertContains(response,'<th>MCC <span class="badge">순위</span></th>');self.assertContains(response,'<th>ROC-AUC</th>')
+        self.finish();services.finalize(self.c.pk)
+        choice=FinalChoice.objects.get(user=self.u,problem=self.b);self.assertEqual(choice.submission_id,self.good.pk)
+        self.good.refresh_from_db();self.assertEqual(self.good.test_score,self.good.test_metrics['mcc'])
+    def test_change_is_refused_when_unsafe(self):
+        with self.assertRaisesMessage(ValidationError,'중에서 선택하세요'):services.change_ranking_metric(self.b.pk,'rmse',None)  # wrong kind
+        with self.assertRaisesMessage(ValidationError,'중에서 선택하세요'):services.change_ranking_metric(self.b.pk,'nope',None)
+        with self.assertRaisesMessage(ValidationError,'이미'):services.change_ranking_metric(self.b.pk,'roc_auc',None)
+        Submission.objects.filter(pk=self.flat.pk).update(val_metrics={'roc_auc':0.5})  # graded before MCC existed
+        with self.assertRaisesMessage(ValidationError,'backfill_metrics'):services.change_ranking_metric(self.b.pk,'mcc',None)
+        self.b.refresh_from_db();self.flat.refresh_from_db();self.assertEqual((self.b.metric,self.flat.val_score),('roc_auc',0.5))
+        out=StringIO();call_command('backfill_metrics',stdout=out);self.assertIn('보충 1건',out.getvalue())  # fills only the missing keys
+        self.flat.refresh_from_db();self.assertEqual((self.flat.val_metrics['mcc'],self.flat.val_metrics['roc_auc']),(0.0,0.5))
+        self.assertEqual(sorted(self.flat.val_metrics),sorted(self.good.val_metrics))
+        self.finish();services.finalize(self.c.pk)
+        with self.assertRaisesMessage(ValidationError,'확정'):services.change_ranking_metric(self.b.pk,'mcc',None)
+    def test_command_and_admin_lock(self):
+        self.other.is_staff=True;self.other.save()
+        out=StringIO();call_command('change_metric',self.b.pk,'mcc','--actor','other',stdout=out)
+        self.assertIn('MCC',out.getvalue());self.b.refresh_from_db();self.assertEqual(self.b.metric,'mcc')
+        self.assertTrue(Audit.objects.filter(action='순위 지표 변경',actor=self.other).exists())
+        with self.assertRaisesMessage(CommandError,'중에서 선택하세요'):call_command('change_metric',self.b.pk,'rmse')
+        with self.assertRaisesMessage(CommandError,'없습니다'):call_command('change_metric',999999,'mcc')
+        self.b.metric='roc_auc'
+        with self.assertRaisesMessage(ValidationError,'고정'):self.b.full_clean()  # the admin form path stays locked
 
 class CreateContestCommandTests(Fixtures, TestCase):
     def test_spec_creates_publishes_and_scores(self):

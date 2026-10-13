@@ -10,7 +10,7 @@ from django.core.exceptions import ValidationError, PermissionDenied
 from django.db import transaction
 from django.utils import timezone
 from .models import (Problem, Contest, Membership, Submission, FinalChoice, RecoveryCode, User, Audit, Announcement)
-from .scoring import validate_datasets, validate_predictions, csv_bytes, read_csv, score, score_all
+from .scoring import validate_datasets, validate_predictions, csv_bytes, read_csv, score, score_all, REGISTRY, metrics_for, metric_kind
 
 
 def audit(actor, action, detail):
@@ -224,6 +224,34 @@ def finalize(contest_id, actor=None):
     c.save(update_fields=['finalized_at'])
     audit(actor, '최종 제출 확정·test 채점', c.pk)
     return c
+
+
+@transaction.atomic
+def change_ranking_metric(problem_id, metric, actor=None):
+    """Switch a published problem's ranking metric and re-derive every stored ranking score from the detail metrics.
+
+    The admin form locks `metric` after publication because val_score is a copy of the primary metric and would
+    silently disagree with a new one; `manage.py change_metric` is the sanctioned path. Refused once the contest is
+    finalized (test scores and final choices exist) and when a scored submission has no usable value for the new
+    metric, in which case backfill_metrics fills the gap first. Returns the number of submissions re-scored."""
+    p = Problem.objects.select_for_update().get(pk=problem_id)
+    c = Contest.objects.select_for_update().get(pk=p.contest_id)
+    if metric not in REGISTRY or metric_kind(metric) != p.kind:
+        allowed = ', '.join(f'{m.key} ({m.label})' for m in metrics_for(p.kind))
+        raise ValidationError(f'{p.get_kind_display()} 문제의 순위 지표는 {allowed} 중에서 선택하세요.')
+    if metric == p.metric: raise ValidationError(f'이미 {REGISTRY[metric].label}이(가) 순위 지표입니다.')
+    if c.finalized_at: raise ValidationError('최종 채점이 확정된 대회의 순위 지표는 바꿀 수 없습니다.')
+    rows = list(Submission.objects.select_for_update().filter(problem=p, status='scored').order_by('received_at'))
+    missing = [s for s in rows if (s.val_metrics or {}).get(metric) is None]
+    if missing:
+        raise ValidationError(f'제출 {len(missing)}건(예: {missing[0].pk})에 {REGISTRY[metric].label} 값이 없습니다. backfill_metrics를 먼저 실행하세요.')
+    for s in rows:
+        s.val_score = s.val_metrics[metric]
+        s.save(update_fields=['val_score'])
+    old = p.metric
+    Problem.objects.filter(pk=p.pk).update(metric=metric)  # bypasses Problem.clean() on purpose
+    audit(actor, '순위 지표 변경', f'{p.pk}: {old} → {metric} · 제출 {len(rows)}건 순위 점수 재산정')
+    return len(rows)
 
 
 @transaction.atomic

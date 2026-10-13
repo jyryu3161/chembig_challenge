@@ -1,7 +1,8 @@
-"""Fill val_metrics/test_metrics for submissions scored before the metric registry existed (scorer chembig-1).
+"""Fill missing detail metrics of scored submissions: val_metrics/test_metrics are empty for submissions graded before
+the metric registry existed (scorer chembig-1) and lack a key for every metric added since they were graded.
 
-Only the detail metrics are written. val_score/test_score are never changed: when the recomputed ranking metric
-does not reproduce the stored score, the submission is reported and left untouched.
+Only missing keys are written. Stored detail values and val_score/test_score are never changed: when the recomputed
+ranking metric does not reproduce the stored score, the submission is reported and left untouched.
 """
 import math
 from django.core.management.base import BaseCommand
@@ -12,7 +13,7 @@ SPLITS = (('val', 'val_score', 'val_metrics'), ('test', 'test_score', 'test_metr
 
 
 class Command(BaseCommand):
-    help = '세부 지표 없이 채점된 제출의 val_metrics·test_metrics를 보충합니다. 점수는 변경하지 않습니다.'
+    help = '채점 완료 제출의 val_metrics·test_metrics에서 비어 있거나 빠진 지표 키를 보충합니다. 점수와 저장된 값은 변경하지 않습니다.'
 
     def add_arguments(self, parser):
         parser.add_argument('--dry-run', action='store_true', help='변경 없이 대상만 출력')
@@ -25,7 +26,8 @@ class Command(BaseCommand):
             updates = {}
             for split, score_field, metrics_field in SPLITS:
                 stored = getattr(s, score_field)
-                if stored is None or getattr(s, metrics_field): continue
+                existing = getattr(s, metrics_field) or {}
+                if stored is None or all(m.key in existing for m in s.problem.all_metrics): continue
                 try:
                     primary, details = evaluate_all(s.problem, disk_path(s.path).read_bytes(), split)
                 except Exception as e:  # unreadable file, changed data, undefined metric: report, never guess
@@ -36,6 +38,7 @@ class Command(BaseCommand):
                     self.stderr.write(f'{s.pk} {split}: 저장 점수 {stored!r} ≠ 재계산 {primary!r} (scorer {s.scorer_version}) · 건너뜀')
                     skipped += 1
                     continue
+                details.update(existing)  # never overwrite a stored value
                 details[s.problem.metric] = stored  # keep the ranking value exactly as stored
                 updates[metrics_field] = details
             if updates:
