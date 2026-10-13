@@ -1,8 +1,10 @@
 from django.contrib import admin, messages
 from django.contrib.auth.admin import UserAdmin
 from django.core.exceptions import ValidationError
+from django.db.models.functions import Substr
 from django.shortcuts import redirect
 from django.urls import reverse
+from django.utils import timezone
 from django_otp.admin import OTPAdminSite
 from .models import User, Semester, Contest, Membership, Problem, Submission, Audit, Announcement
 from . import services
@@ -86,15 +88,52 @@ class ProblemAdmin(ServiceDeleteMixin,AuditedAdmin):
         if n: return f'삭제 불가 · 제출 {n}건이 있습니다.'
         return '삭제 가능 · 제출이 없습니다. 아래 삭제 버튼은 데이터 파일을 함께 지우고 작업 기록에 남깁니다.'
 
+class ContestPhaseFilter(admin.SimpleListFilter):
+    """Memberships of ended contests cannot change state, so the operator usually wants only open ones."""
+    title='대회 진행'
+    parameter_name='phase'
+    def lookups(self,request,model_admin): return [('open','진행 중·예정'),('ended','종료')]
+    def queryset(self,request,queryset):
+        if self.value()=='open': return queryset.filter(contest__closes_at__gt=timezone.now())
+        if self.value()=='ended': return queryset.filter(contest__closes_at__lte=timezone.now())
+        return queryset
+
+class CohortFilter(admin.SimpleListFilter):
+    """Student IDs start with the admission year, so the first four characters group a class cohort."""
+    title='학번 앞 4자리'
+    parameter_name='cohort'
+    def lookups(self,request,model_admin):
+        prefixes=model_admin.get_queryset(request).annotate(prefix=Substr('student_id',1,4)).order_by('-prefix').values_list('prefix',flat=True).distinct()
+        return [(p,p) for p in prefixes if p]
+    def queryset(self,request,queryset):
+        return queryset.filter(student_id__startswith=self.value()) if self.value() else queryset
+
 @admin.register(Membership)
 class MembershipAdmin(AuditedAdmin):
-    list_display=['user','contest','student_id','status','created_at']
-    list_filter=['contest','status']
-    search_fields=['user__username','user__real_name','student_id']
+    """Approval desk: filter (phase, contest, status, cohort, date) → sort → header checkbox → bulk action.
+    Every column sorts; the status column sorts in workflow order rather than alphabetically."""
+    list_display=['contest','student_id','real_name','username','nickname','status_label','created_at']
+    list_display_links=['student_id']
+    list_filter=[ContestPhaseFilter,('contest',admin.RelatedOnlyFieldListFilter),'status',CohortFilter,('created_at',admin.DateFieldListFilter)]
+    list_select_related=['user','contest']
+    ordering=['-contest__opens_at',Membership.STATUS_RANK.asc(),'student_id']
+    search_fields=['student_id','user__username','user__real_name','user__nickname']
+    search_help_text='학번·아이디·이름·별명으로 검색합니다. 필터로 추린 뒤 머리글 확인란으로 전체 선택하고 일괄 작업을 실행하세요.'
+    show_facets=admin.ShowFacets.ALWAYS  # filter choices show counts, e.g. 승인 대기 (12)
     readonly_fields=['user','contest','student_id','status']
     list_per_page=200
+    list_max_show_all=1000
     actions=['approve_selected','suspend_selected']  # the changelist has select-all; status changes go through the service
+    actions_on_bottom=True
     def has_add_permission(self,request): return False
+    @admin.display(description='이름',ordering='user__real_name')
+    def real_name(self,obj): return obj.user.real_name
+    @admin.display(description='아이디',ordering='user__username')
+    def username(self,obj): return obj.user.username
+    @admin.display(description='별명',ordering='user__nickname')
+    def nickname(self,obj): return obj.user.nickname
+    @admin.display(description='상태',ordering=Membership.STATUS_RANK)
+    def status_label(self,obj): return obj.get_status_display()
     @admin.action(description='선택한 참가자 승인',permissions=['change'])
     def approve_selected(self,request,queryset): self._set_status(request,queryset,'approved')
     @admin.action(description='선택한 참가자 정지',permissions=['change'])

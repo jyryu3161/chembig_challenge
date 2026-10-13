@@ -1,4 +1,5 @@
 import math
+import re
 import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -213,9 +214,10 @@ class WorkflowTests(Fixtures, TestCase):
 
 class AccessTests(Fixtures, TestCase):
     def test_public_and_approved_pages(self):
-        for path in ['/','/contests/','/contests/?archive=1','/guide/','/login/','/signup/','/recover/',f'/contests/{self.c.pk}/',f'/contests/{self.c.pk}/rules/']:
+        for path in ['/','/contests/','/contests/?archive=1','/guide/','/login/','/signup/','/recover/',f'/contests/{self.c.pk}/',f'/contests/{self.c.pk}/rules/',
+                     f'/contests/{self.c.pk}/leaderboard/',f'/contests/{self.c.pk}/leaderboard/?problem=\u00b2']:
             self.assertEqual(self.client.get(path).status_code,200,path)
-        for tab in ['problems','leaderboard','submit','submissions']:
+        for tab in ['problems','submit','submissions']:
             path=f'/contests/{self.c.pk}/{tab}/'
             self.assertEqual(self.client.get(path).status_code,403)
             self.client.force_login(self.u)
@@ -228,6 +230,20 @@ class AccessTests(Fixtures, TestCase):
             response=self.client.get(f'/contests/{self.c.pk}/{tab}/')
             self.assertNotContains(response,'987.654321');self.assertNotContains(response,'비공개실명')
         self.assertContains(self.client.get(f'/contests/{self.c.pk}/leaderboard/'),'초록분자')
+    def test_leaderboard_is_public_but_data_and_submission_are_not(self):
+        s=self.accept();grade(str(s.pk));Submission.objects.filter(pk=s.pk).update(test_score=987.654321)
+        response=self.client.get(f'/contests/{self.c.pk}/leaderboard/')  # anonymous
+        self.assertEqual(response.status_code,200);self.assertContains(response,'초록분자');self.assertContains(response,'참가 신청 →')
+        self.assertNotContains(response,'비공개실명');self.assertNotContains(response,'987.654321');self.assertNotContains(response,'<span class="badge">나</span>')
+        self.assertEqual(self.client.get(f'/contests/{self.c.pk}/problems/').status_code,403)
+        self.assertEqual(self.client.get(f'/problems/{self.p.pk}/files/val/').status_code,403)
+        self.assertEqual(self.client.post(f'/problems/{self.p.pk}/submit/').status_code,302)  # login_required
+        self.c.visible=False;self.c.save(update_fields=['visible'])
+        self.assertEqual(self.client.get(f'/contests/{self.c.pk}/leaderboard/').status_code,404)  # hidden contests stay hidden
+        self.c.visible=True;self.c.save(update_fields=['visible'])
+        self.m.status='suspended';self.m.save(update_fields=['status']);self.client.force_login(self.u)
+        response=self.client.get(f'/contests/{self.c.pk}/leaderboard/')
+        self.assertEqual(response.status_code,200);self.assertContains(response,'아직 채점 완료된 제출이 없습니다')  # suspended: can look, is not ranked
     def test_files_and_other_submission(self):
         s=self.accept();url=f'/problems/{self.p.pk}/files/val/'
         self.assertEqual(self.client.get(url).status_code,403)
@@ -297,7 +313,7 @@ class AccessTests(Fixtures, TestCase):
         pending=Membership.objects.create(user=self.other,contest=self.c,student_id='0002',status='pending')
         response=self.client.get('/ops/');self.assertContains(response,'id="select-all-members"');self.assertContains(response,'input[name=members]')
         response=self.client.post('/ops/approve/',{'state':'approved','members':[str(self.m.pk),str(pending.pk)]})
-        self.assertRedirects(response,'/ops/',fetch_redirect_response=False);pending.refresh_from_db();self.assertEqual(pending.status,'approved')
+        self.assertRedirects(response,'/ops/#members',fetch_redirect_response=False);pending.refresh_from_db();self.assertEqual(pending.status,'approved')
         self.assertContains(self.client.get('/ops/'),'참가자 1명의 상태를 변경했습니다')
         response=self.client.get('/admin/arena/membership/');self.assertContains(response,'action-toggle');self.assertContains(response,'approve_selected')
         response=self.client.post('/admin/arena/membership/',{'action':'suspend_selected','_selected_action':[str(self.m.pk),str(pending.pk)],'index':'0'})
@@ -316,6 +332,70 @@ class AccessTests(Fixtures, TestCase):
     def test_throttle(self):
         for _ in range(15):self.client.post('/login/',{'username':'unknown','password':'wrong'})
         self.assertEqual(self.client.post('/login/',{'username':'unknown','password':'wrong'}).status_code,429)
+
+class RosterTests(Fixtures, TestCase):
+    """Participant table of the operations page and the admin membership list: scope, filters, sorting, paging."""
+    def setUp(self):
+        super().setUp()
+        self.other.is_staff=True;self.other.is_superuser=True;self.other.save()
+        device=TOTPDevice.objects.create(user=self.other,name='test',confirmed=True)
+        self.client.force_login(self.other);session=self.client.session;session['otp_device_id']=device.persistent_id;session.save()
+        self.old=Contest.objects.create(semester=self.semester,title='지난 대회',description='소개',opens_at=timezone.now()-timedelta(days=30),
+            closes_at=timezone.now()-timedelta(days=1),invite_code='OLD',visible=True)
+        self.late=User.objects.create_user(username='late',password='strong-password',real_name='늦은학생',student_id='20259999',nickname='노란분자')
+        self.pending=Membership.objects.create(user=self.late,contest=self.c,student_id=self.late.student_id,status='pending')
+        self.archived=Membership.objects.create(user=self.other,contest=self.old,student_id=self.other.student_id,status='approved')
+    def rows(self,response):
+        """Student IDs in table order on the operations page."""
+        return re.findall(r'name="members" value="\d+" aria-label="([^" ]+) [^"]+ 선택"',response.content.decode())
+    def admin_rows(self,response):
+        return re.findall(r'field-student_id"><a href="[^"]+">([^<]+)<',response.content.decode())
+    def test_roster_scope_defaults_to_open_contests(self):
+        response=self.client.get('/ops/');self.assertEqual(response.status_code,200)
+        self.assertEqual(self.rows(response),['20259999','0001'])  # workflow order: pending before approved
+        self.assertNotContains(response,'지난 대회 <span class="badge gray">종료</span>')
+        response=self.client.get('/ops/?contest=all');self.assertEqual(self.rows(response),['20259999','0001','0002'])
+        self.assertContains(response,'disabled title="종료된 대회는 변경할 수 없습니다"')
+        response=self.client.get(f'/ops/?contest={self.old.pk}');self.assertEqual(self.rows(response),['0002'])
+    def test_roster_status_chips_and_search(self):
+        response=self.client.get('/ops/?status=pending');self.assertEqual(self.rows(response),['20259999'])
+        self.assertContains(response,'전체 <strong>2</strong>');self.assertContains(response,'승인 대기 <strong>1</strong>')  # counts ignore the status filter
+        self.assertContains(response,'class="chip active" href="?status=pending#members"')
+        self.assertEqual(self.rows(self.client.get('/ops/?q=노란')),['20259999'])  # nickname
+        self.assertEqual(self.rows(self.client.get('/ops/?q=0001')),['0001'])
+        self.assertEqual(self.rows(self.client.get('/ops/?contest=all&q=다른실명')),['0002'])
+    def test_roster_sorts_by_column_and_ignores_bad_params(self):
+        response=self.client.get('/ops/?sort=student_id');self.assertEqual(self.rows(response),['0001','20259999']);self.assertContains(response,'aria-sort="ascending"')
+        response=self.client.get('/ops/?sort=-student_id');self.assertEqual(self.rows(response),['20259999','0001']);self.assertContains(response,'aria-sort="descending"')
+        self.assertEqual(self.rows(self.client.get('/ops/?sort=-status')),['0001','20259999'])
+        self.assertEqual(self.rows(self.client.get('/ops/?sort=name')),['20259999','0001'])
+        response=self.client.get('/ops/?sort=bogus&page=xyz&contest=999999&status=nope&q='+'x'*500)
+        self.assertEqual(response.status_code,200);self.assertEqual(self.rows(response),[])
+        self.assertEqual(self.rows(self.client.get('/ops/?sort=bogus&page=xyz&contest=999999&status=nope')),['20259999','0001'])
+    def test_roster_pages_and_approve_returns_to_the_same_view(self):
+        with patch('arena.views.ROSTER_PAGE',1):
+            self.assertEqual(self.client.get('/ops/?status=pending&page=2').status_code,200)  # out of range → last page
+            response=self.client.get('/ops/?page=2');self.assertEqual(self.rows(response),['0001'])
+            self.assertContains(response,'2 / 2 페이지');self.assertContains(response,'href="?page=1#members"')
+        response=self.client.post('/ops/approve/',{'state':'approved','members':[str(self.pending.pk)],'contest':str(self.c.pk),'status':'pending','q':'','sort':'','page':'1'})
+        self.assertRedirects(response,f'/ops/?contest={self.c.pk}&status=pending&page=1#members',fetch_redirect_response=False)
+        self.pending.refresh_from_db();self.assertEqual(self.pending.status,'approved')
+        response=self.client.post('/ops/approve/',{'state':'approved'});self.assertRedirects(response,'/ops/#members',fetch_redirect_response=False)
+        self.assertContains(self.client.get('/ops/'),'선택한 참가자가 없습니다')
+    def test_admin_membership_list_filters_sorts_and_counts(self):
+        url='/admin/arena/membership/'
+        response=self.client.get(url);self.assertEqual(response.status_code,200);self.assertEqual(self.admin_rows(response),['20259999','0001','0002'])
+        self.assertContains(response,'진행 중·예정 (2)');self.assertContains(response,'종료 (1)');self.assertContains(response,'승인 대기 (1)')  # facet counts
+        response=self.client.get(url+'?phase=open');self.assertEqual(self.admin_rows(response),['20259999','0001'])
+        response=self.client.get(url+'?phase=ended');self.assertEqual(self.admin_rows(response),['0002'])
+        response=self.client.get(url+'?cohort=2025');self.assertEqual(self.admin_rows(response),['20259999'])
+        response=self.client.get(url+'?q=노란분자');self.assertEqual(self.admin_rows(response),['20259999'])
+        # column 0 is the action checkbox: 1 대회, 2 학번, 3 이름, 4 아이디, 5 별명, 6 상태, 7 신청 시각
+        self.assertEqual(self.admin_rows(self.client.get(url+'?o=2')),['0001','0002','20259999'])  # 학번
+        self.assertEqual(self.admin_rows(self.client.get(url+'?o=-2')),['20259999','0002','0001'])
+        self.assertEqual(self.admin_rows(self.client.get(url+'?o=6'))[0],'20259999')  # 상태: pending first
+        self.assertEqual(self.admin_rows(self.client.get(url+'?o=-6'))[-1],'20259999')
+        self.assertEqual(self.client.get(url+'?phase=open&status__exact=pending&cohort=2025&o=-1.3').status_code,200)
 
 class PostgresConcurrencyTests(Fixtures, TransactionTestCase):
     def setUp(self):

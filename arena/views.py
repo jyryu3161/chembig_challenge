@@ -5,15 +5,18 @@ import secrets
 import shutil
 import uuid
 from functools import wraps
+from urllib.parse import urlencode
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import login
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied, ValidationError
+from django.core.paginator import Paginator
 from django.db import IntegrityError, transaction
 from django.db.models import Count, Q
 from django.http import FileResponse, Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 from .models import Contest, Problem, Membership, Submission, FinalChoice, Announcement, User, Audit
@@ -90,7 +93,7 @@ def profile(request):
         form.save()
         messages.success(request, '공개 이름 설정을 저장했습니다.')
         return redirect('profile')
-    return render(request, 'arena/form.html', {'form':form, 'title':'내 프로필', 'intro':'순위표에는 기본으로 별명이 표시됩니다. 이름·학번은 관리자만 확인합니다.', 'button':'설정 저장'})
+    return render(request, 'arena/form.html', {'form':form, 'title':'내 프로필', 'intro':'순위표는 누구나 볼 수 있고 기본으로 별명이 표시됩니다. 실명 표시를 켜면 순위표에 실명이 공개됩니다. 학번은 관리자만 확인합니다.', 'button':'설정 저장'})
 
 
 def recover(request):
@@ -109,7 +112,9 @@ def contest(request, pk, tab='overview'):
     if tab not in ['overview','problems','rules','leaderboard','submit','submissions']: raise Http404
     member = Membership.objects.filter(user=request.user, contest=c).first() if request.user.is_authenticated else None
     allowed = is_operator(request.user) or bool(member and member.status == 'approved')
-    if tab in ['problems','leaderboard','submit','submissions']: access(request,c)
+    # The leaderboard is public (names are nicknames unless the student opted into real names); data and submission
+    # stay behind approval.
+    if tab in ['problems','submit','submissions']: access(request,c)
     problems = c.problems.filter(published_at__isnull=False)
     wanted = pk_or_none(request.GET.get('problem'))
     selected = problems.filter(pk=wanted).first() if wanted is not None else problems.first()
@@ -215,6 +220,44 @@ def submission_file(request, sid):
     return send_file(s.path, f'{s.pk}.csv', 'submissions')
 
 
+# Participant table of the operations page. One sort key per column; the rest are stable tiebreakers.
+ROSTER_SORTS = {'contest': '-contest__opens_at', 'student_id': 'student_id', 'name': 'user__real_name', 'status': 'status_rank', 'created': 'created_at'}
+ROSTER_COLUMNS = [('contest', '대회'), ('student_id', '학번'), ('name', '이름'), ('status', '상태'), ('created', '신청 시각')]
+ROSTER_PARAMS = ('contest', 'status', 'q', 'sort', 'page')
+ROSTER_PAGE = 200
+
+
+def member_roster(params, contests):
+    """Filter (contest scope, status, search), sort and page the participant table from query parameters.
+
+    Unrecognised values fall back to their defaults so a hand-edited URL never 500s. The default scope is contests
+    that have not ended, because set_membership_status skips ended ones anyway; `contest=all` widens it. Status
+    counts are computed before the status filter so the chips always show the whole scope."""
+    scope = (params.get('contest') or '').strip()
+    status = params.get('status') if params.get('status') in dict(Membership.STATUS) else ''
+    q = (params.get('q') or '').strip()[:60]
+    sort = params.get('sort') if (params.get('sort') or '').lstrip('-') in ROSTER_SORTS else 'contest'
+    rows = Membership.objects.select_related('user', 'contest').annotate(status_rank=Membership.STATUS_RANK)
+    contest_pk = pk_or_none(scope)
+    if contest_pk in {c.pk for c in contests}: rows = rows.filter(contest_id=contest_pk)
+    elif scope == 'all': pass
+    else: scope, rows = '', rows.filter(contest__closes_at__gt=timezone.now())
+    if q: rows = rows.filter(Q(student_id__icontains=q) | Q(user__username__icontains=q) | Q(user__real_name__icontains=q) | Q(user__nickname__icontains=q))
+    counts = {row['status']: row['n'] for row in rows.order_by().values('status').annotate(n=Count('pk'))}
+    if status: rows = rows.filter(status=status)
+    key = sort.lstrip('-')
+    primary = ROSTER_SORTS[key]
+    if sort.startswith('-'): primary = primary[1:] if primary.startswith('-') else '-' + primary
+    page = Paginator(rows.order_by(primary, '-contest__opens_at', 'status_rank', 'student_id', 'pk'), ROSTER_PAGE).get_page(params.get('page'))
+    state = {'contest': scope, 'status': status, 'q': q, 'sort': '' if sort == 'contest' else sort}
+    def query(**override): return urlencode({k: v for k, v in {**state, **override}.items() if v})
+    columns = [(label, query(sort='-' + k if sort == k else k), ' ▲' if sort == k else ' ▼' if sort == '-' + k else '') for k, label in ROSTER_COLUMNS]
+    chips = [('전체', sum(counts.values()), query(status=''), status == '')] + [(label, counts.get(k, 0), query(status=k), status == k) for k, label in Membership.STATUS]
+    return {**state, 'page': page, 'columns': columns, 'chips': chips, 'filtered': any(state.values()),
+            'prev_query': query(page=page.previous_page_number()) if page.has_previous() else None,
+            'next_query': query(page=page.next_page_number()) if page.has_next() else None}
+
+
 @staff_only
 def operations(request):
     root = settings.DATA_ROOT
@@ -223,8 +266,8 @@ def operations(request):
     backup = None
     try: backup = json.loads((root/'backups'/'last_success.json').read_text())
     except (OSError, ValueError): pass
-    return render(request, 'arena/operations.html', {'contests':Contest.objects.annotate(n_submissions=Count('problems__submission')),
-        'members':Membership.objects.select_related('user','contest').order_by('status','created_at'),
+    contests = list(Contest.objects.select_related('semester').prefetch_related('problems').annotate(n_submissions=Count('problems__submission')))
+    return render(request, 'arena/operations.html', {'contests':contests, 'roster':member_roster(request.GET, contests),
         'failed':Submission.objects.filter(status='error').select_related('user','problem'),
         'pending':Submission.objects.filter(status__in=['pending','processing']).count(),
         'free_gb':round(usage.free/1024**3,1), 'backup':backup, 'audits':Audit.objects.select_related('actor')[:15]})
@@ -236,9 +279,14 @@ def approve(request):
     state = request.POST.get('state')
     if state not in ['approved','suspended']: raise Http404
     selected = [pk for pk in map(pk_or_none, request.POST.getlist('members')) if pk is not None]
-    changed = services.set_membership_status(selected, state, request.user)
-    messages.success(request,f'참가자 {changed}명의 상태를 변경했습니다. 종료된 대회와 이미 같은 상태인 참가자는 제외됩니다.')
-    return redirect('operations')
+    if selected:
+        changed = services.set_membership_status(selected, state, request.user)
+        messages.success(request,f'참가자 {changed}명의 상태를 변경했습니다. 종료된 대회와 이미 같은 상태인 참가자는 제외됩니다.')
+    else:
+        messages.warning(request,'선택한 참가자가 없습니다. 확인란으로 참가자를 선택한 뒤 다시 실행하세요.')
+    # Back to the same filter, sort and page the operator was looking at; member_roster re-validates every value.
+    back = urlencode({k: v for k in ROSTER_PARAMS if (v := request.POST.get(k, '').strip())})
+    return redirect(reverse('operations') + ('?' + back if back else '') + '#members')
 
 
 @staff_only

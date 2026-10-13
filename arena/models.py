@@ -71,11 +71,14 @@ class Contest(models.Model):
 
 class Membership(models.Model):
     STATUS = [('pending', '승인 대기'), ('approved', '참가 승인'), ('suspended', '참가 정지')]
-    user = models.ForeignKey(User, on_delete=models.PROTECT)
-    contest = models.ForeignKey(Contest, on_delete=models.PROTECT)
+    # Workflow order (pending → approved → suspended) for sorting lists; the stored values would sort alphabetically.
+    STATUS_RANK = models.Case(*[models.When(status=key, then=models.Value(rank)) for rank, (key, _) in enumerate(STATUS)],
+        default=models.Value(len(STATUS)), output_field=models.IntegerField())
+    user = models.ForeignKey(User, on_delete=models.PROTECT, verbose_name='사용자')
+    contest = models.ForeignKey(Contest, on_delete=models.PROTECT, verbose_name='대회')
     student_id = models.CharField('학번', max_length=30)
     status = models.CharField('상태', max_length=12, choices=STATUS, default='pending')
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField('신청 시각', auto_now_add=True)
     class Meta:
         constraints = [models.UniqueConstraint(fields=['user', 'contest'], name='one_membership'),
             models.UniqueConstraint(fields=['contest', 'student_id'], name='one_student_per_contest')]
