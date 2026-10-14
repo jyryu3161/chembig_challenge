@@ -193,15 +193,6 @@ def ordered_scores(problem, queryset, final=False):
 
 
 @transaction.atomic
-def choose_final(user, submission_id):
-    s = Submission.objects.select_related('problem').get(pk=submission_id, user=user)
-    c = Contest.objects.select_for_update().get(pk=s.problem.contest_id)
-    if not c.is_open or s.status != 'scored': raise ValidationError('마감 전 채점 완료 제출만 지정할 수 있습니다.')
-    if not Membership.objects.filter(user=user, contest=c, status='approved').exists(): raise PermissionDenied
-    FinalChoice.objects.update_or_create(user=user, problem=s.problem, defaults={'submission':s, 'automatic':False})
-
-
-@transaction.atomic
 def finalize(contest_id, actor=None):
     c = Contest.objects.select_for_update().get(pk=contest_id)
     if c.finalized_at: return c
@@ -213,11 +204,10 @@ def finalize(contest_id, actor=None):
     for p in c.problems.filter(published_at__isnull=False):
         submissions = Submission.objects.filter(problem=p, status='scored', received_at__lt=c.closes_at)
         for uid in submissions.values_list('user_id', flat=True).distinct():
-            choice = FinalChoice.objects.filter(user_id=uid, problem=p).first()
-            if not choice:
-                s = ordered_scores(p, submissions.filter(user_id=uid)).first()
-                choice = FinalChoice.objects.create(user_id=uid, problem=p, submission=s, automatic=True)
-            s = choice.submission
+            # The leaderboard entry counts: best val score, earliest receipt on ties. Students do not pick; a
+            # FinalChoice row left by the former manual selection is overwritten.
+            s = ordered_scores(p, submissions.filter(user_id=uid)).first()
+            FinalChoice.objects.update_or_create(user_id=uid, problem=p, defaults={'submission': s, 'automatic': True})
             s.test_score, s.test_metrics = evaluate_all(p, disk_path(s.path).read_bytes(), 'test')
             s.save(update_fields=['test_score', 'test_metrics'])
     c.finalized_at = timezone.now()

@@ -151,14 +151,23 @@ class WorkflowTests(Fixtures, TestCase):
         self.assertTrue(FinalChoice.objects.get(submission=s).automatic)
         services.release(self.c.pk,self.u)
         self.c.refresh_from_db();self.assertIsNotNone(self.c.released_at)
-        with self.assertRaises(ValidationError):services.choose_final(self.u,s.pk)
-    def test_explicit_choice_and_tie_break(self):
+        self.client.force_login(self.u);self.assertEqual(self.client.post(f'/submissions/{s.pk}/choose/').status_code,404)  # manual choice is gone
+    def test_manual_choice_is_ignored_and_tie_break(self):
         first=self.accept();grade(str(first.pk))
         second=self.accept();grade(str(second.pk))
         self.assertEqual(services.ordered_scores(self.p,Submission.objects.all()).first().pk,first.pk)
-        services.choose_final(self.u,second.pk)
+        FinalChoice.objects.create(user=self.u,problem=self.p,submission=second,automatic=False)  # row left by the former manual selection
         self.finish();services.finalize(self.c.pk)
-        self.assertEqual(FinalChoice.objects.get(user=self.u).submission_id,second.pk)
+        choice=FinalChoice.objects.get(user=self.u);self.assertEqual((choice.submission_id,choice.automatic),(first.pk,True))
+    def test_submissions_tab_marks_the_counted_submission(self):
+        worse=self.accept(self.raw.replace(b'val_001,0',b'val_001,2'));grade(str(worse.pk))
+        best=self.accept();grade(str(best.pk))
+        self.client.force_login(self.u);response=self.client.get(f'/contests/{self.c.pk}/submissions/')
+        self.assertEqual(response.content.decode().count('순위표 반영'),1);self.assertNotContains(response,'최종 지정')
+        self.assertContains(response,'따로 최종 제출을 지정하지 않습니다');self.assertContains(response,'<th>최종 평가</th>')
+        self.finish();services.finalize(self.c.pk);Submission.objects.filter(pk=best.pk).update(test_score=987.654321)
+        response=self.client.get(f'/contests/{self.c.pk}/submissions/')
+        self.assertEqual(response.content.decode().count('test 채점'),1);self.assertNotContains(response,'987.654321')  # still secret before release
     def test_best_val_auto_choice(self):
         worse=self.accept(self.raw.replace(b'val_001,0',b'val_001,2'));grade(str(worse.pk))
         best=self.accept();grade(str(best.pk))
@@ -328,10 +337,9 @@ class AccessTests(Fixtures, TestCase):
         self.other.student_id=self.u.student_id;self.other.save();self.client.force_login(self.other)
         self.client.post(f'/contests/{self.c.pk}/join/',{'invite_code':'CODE'})
         self.assertEqual(Membership.objects.count(),1)
-    def test_suspended_cannot_submit_or_choose(self):
+    def test_suspended_cannot_submit(self):
         s=self.accept();grade(str(s.pk));self.m.status='suspended';self.m.save()
         with self.assertRaises(PermissionDenied):self.accept()
-        with self.assertRaises(PermissionDenied):services.choose_final(self.u,s.pk)
     def test_throttle(self):
         for _ in range(15):self.client.post('/login/',{'username':'unknown','password':'wrong'})
         self.assertEqual(self.client.post('/login/',{'username':'unknown','password':'wrong'}).status_code,429)

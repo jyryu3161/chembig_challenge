@@ -132,13 +132,15 @@ def contest(request, pk, tab='overview'):
                     'extras':[(details or {}).get(m.key) for m in secondary]})
     submissions = []
     if tab == 'submissions':
-        choices = set(FinalChoice.objects.filter(user=request.user, problem__contest=c).values_list('submission_id', flat=True))
+        # The submission that counts per problem: the user's best val score (the leaderboard entry) while the contest
+        # runs, the one that was test-scored once finalized.
+        if c.finalized_at: counted = set(FinalChoice.objects.filter(user=request.user, problem__contest=c).values_list('submission_id', flat=True))
+        else: counted = {pk for p in problems for pk in services.ordered_scores(p, Submission.objects.filter(user=request.user, problem=p, status='scored', received_at__lt=c.closes_at)).values_list('pk', flat=True)[:1]}
         metrics = {}  # problem pk -> metric list, built once per problem instead of per submission
         for s in Submission.objects.filter(user=request.user, problem__contest=c).select_related('problem').order_by('-received_at')[:200]:
             if s.problem_id not in metrics: metrics[s.problem_id] = s.problem.all_metrics
             submissions.append({'id':s.pk, 'problem':s.problem, 'received_at':s.received_at, 'status':s.get_status_display(),
-                'val_score':s.val_score, 'test_score':s.test_score if c.released_at else None, 'selected':s.pk in choices,
-                'can_select':c.is_open and s.status=='scored',
+                'val_score':s.val_score, 'test_score':s.test_score if c.released_at else None, 'counted':s.pk in counted,
                 'val_details':metric_details(metrics[s.problem_id], s.problem.metric, s.val_metrics, s.val_score),
                 'test_details':metric_details(metrics[s.problem_id], s.problem.metric, s.test_metrics, s.test_score) if c.released_at else []})
     return render(request, 'arena/contest.html', {'contest':c,'tab':tab,'membership':member,'allowed':allowed,'problems':problems,
@@ -180,16 +182,6 @@ def submit(request, pk):
             return redirect('contest-tab', pk=p.contest_id, tab='submissions')
     else: messages.error(request, '파일과 제출 요청을 확인하세요. 제출 화면을 새로 열어 다시 시도하세요.')
     return redirect('contest-tab', pk=p.contest_id, tab='submit')
-
-
-@login_required
-@require_POST
-def choose(request, sid):
-    s = get_object_or_404(Submission, pk=sid, user=request.user)
-    try: services.choose_final(request.user, sid)
-    except ValidationError as e: messages.error(request,' '.join(e.messages))
-    else: messages.success(request,'최종 제출로 지정했습니다.')
-    return redirect('contest-tab', pk=s.problem.contest_id, tab='submissions')
 
 
 def send_file(relative, name, prefix):
