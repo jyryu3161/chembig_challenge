@@ -168,8 +168,8 @@ class Submission(models.Model):
         verbose_name_plural = verbose_name
 
 class FinalChoice(models.Model):
-    """Which submission was test-scored at finalization: the student's best val submission (the leaderboard entry).
-    `automatic` is always True since the manual selection was removed on 2026-10-14; the column stays for old rows."""
+    """Which submission was test-scored at finalization: the student's last submission before the deadline (the
+    leaderboard entry). `automatic` is always True since the manual selection was removed on 2026-10-14."""
     user = models.ForeignKey(User, on_delete=models.PROTECT)
     problem = models.ForeignKey(Problem, on_delete=models.PROTECT)
     submission = models.ForeignKey(Submission, on_delete=models.PROTECT)

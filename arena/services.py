@@ -8,6 +8,7 @@ from django.contrib.auth.hashers import make_password, check_password
 from django.contrib.sessions.models import Session
 from django.core.exceptions import ValidationError, PermissionDenied
 from django.db import transaction
+from django.db.models import OuterRef, Subquery
 from django.utils import timezone
 from .models import (Problem, Contest, Membership, Submission, FinalChoice, RecoveryCode, User, Audit, Announcement)
 from .scoring import validate_datasets, validate_predictions, csv_bytes, read_csv, score, score_all, REGISTRY, metrics_for, metric_kind
@@ -192,6 +193,13 @@ def ordered_scores(problem, queryset, final=False):
     return queryset.order_by(field if problem.minimize else '-'+field, 'received_at', 'id')
 
 
+def latest_per_user(queryset):
+    """Each user's most recently received submission within `queryset`: the one that counts for ranking and for the
+    final test scoring. Students do not pick; whatever they submitted last before the deadline is evaluated."""
+    latest = queryset.filter(user_id=OuterRef('user_id')).order_by('-received_at', '-id').values('pk')[:1]
+    return queryset.filter(pk=Subquery(latest))
+
+
 @transaction.atomic
 def finalize(contest_id, actor=None):
     c = Contest.objects.select_for_update().get(pk=contest_id)
@@ -204,9 +212,9 @@ def finalize(contest_id, actor=None):
     for p in c.problems.filter(published_at__isnull=False):
         submissions = Submission.objects.filter(problem=p, status='scored', received_at__lt=c.closes_at)
         for uid in submissions.values_list('user_id', flat=True).distinct():
-            # The leaderboard entry counts: best val score, earliest receipt on ties. Students do not pick; a
-            # FinalChoice row left by the former manual selection is overwritten.
-            s = ordered_scores(p, submissions.filter(user_id=uid)).first()
+            # The last submission received before the deadline counts (the leaderboard entry). Students do not pick;
+            # a FinalChoice row left by the former manual selection is overwritten.
+            s = submissions.filter(user_id=uid).order_by('-received_at', '-id').first()
             FinalChoice.objects.update_or_create(user_id=uid, problem=p, defaults={'submission': s, 'automatic': True})
             s.test_score, s.test_metrics = evaluate_all(p, disk_path(s.path).read_bytes(), 'test')
             s.save(update_fields=['test_score', 'test_metrics'])

@@ -152,27 +152,30 @@ class WorkflowTests(Fixtures, TestCase):
         services.release(self.c.pk,self.u)
         self.c.refresh_from_db();self.assertIsNotNone(self.c.released_at)
         self.client.force_login(self.u);self.assertEqual(self.client.post(f'/submissions/{s.pk}/choose/').status_code,404)  # manual choice is gone
-    def test_manual_choice_is_ignored_and_tie_break(self):
+    def test_last_submission_is_final_and_manual_choice_is_ignored(self):
         first=self.accept();grade(str(first.pk))
         second=self.accept();grade(str(second.pk))
-        self.assertEqual(services.ordered_scores(self.p,Submission.objects.all()).first().pk,first.pk)
-        FinalChoice.objects.create(user=self.u,problem=self.p,submission=second,automatic=False)  # row left by the former manual selection
+        self.assertEqual(services.ordered_scores(self.p,Submission.objects.all()).first().pk,first.pk)  # ranking tie-break: earlier receipt
+        FinalChoice.objects.create(user=self.u,problem=self.p,submission=first,automatic=False)  # row left by the former manual selection
         self.finish();services.finalize(self.c.pk)
-        choice=FinalChoice.objects.get(user=self.u);self.assertEqual((choice.submission_id,choice.automatic),(first.pk,True))
-    def test_submissions_tab_marks_the_counted_submission(self):
-        worse=self.accept(self.raw.replace(b'val_001,0',b'val_001,2'));grade(str(worse.pk))
+        choice=FinalChoice.objects.get(user=self.u);self.assertEqual((choice.submission_id,choice.automatic),(second.pk,True))
+    def test_submissions_tab_and_leaderboard_follow_the_last_submission(self):
         best=self.accept();grade(str(best.pk))
+        worse=self.accept(self.raw.replace(b'val_001,0',b'val_001,2'));grade(str(worse.pk))  # RMSE 1.414214
         self.client.force_login(self.u);response=self.client.get(f'/contests/{self.c.pk}/submissions/')
-        self.assertEqual(response.content.decode().count('순위표 반영'),1);self.assertNotContains(response,'최종 지정')
+        html=response.content.decode();self.assertEqual(html.count('평가 대상'),1);self.assertNotContains(response,'최종 지정')
+        self.assertLess(html.index('1.414214'),html.index('평가 대상'))  # the badge sits on the later, worse submission (newest first)
         self.assertContains(response,'따로 최종 제출을 지정하지 않습니다');self.assertContains(response,'<th>최종 평가</th>')
-        self.finish();services.finalize(self.c.pk);Submission.objects.filter(pk=best.pk).update(test_score=987.654321)
+        response=self.client.get(f'/contests/{self.c.pk}/leaderboard/')
+        self.assertContains(response,'class="score">1.414214');self.assertNotContains(response,'class="score">0.000000')  # ranked by the last one
+        self.finish();services.finalize(self.c.pk);Submission.objects.filter(pk=worse.pk).update(test_score=987.654321)
         response=self.client.get(f'/contests/{self.c.pk}/submissions/')
         self.assertEqual(response.content.decode().count('test 채점'),1);self.assertNotContains(response,'987.654321')  # still secret before release
-    def test_best_val_auto_choice(self):
-        worse=self.accept(self.raw.replace(b'val_001,0',b'val_001,2'));grade(str(worse.pk))
+    def test_last_submission_counts_even_when_worse(self):
         best=self.accept();grade(str(best.pk))
+        worse=self.accept(self.raw.replace(b'val_001,0',b'val_001,2'));grade(str(worse.pk))
         self.finish();services.finalize(self.c.pk)
-        self.assertEqual(FinalChoice.objects.get(user=self.u).submission_id,best.pk)
+        self.assertEqual(FinalChoice.objects.get(user=self.u).submission_id,worse.pk)
     def test_retry_max_and_once_only(self):
         s=self.accept()
         with patch('arena.tasks.evaluate_all',side_effect=OSError('disk')):
@@ -653,7 +656,7 @@ class BackfillMetricsCommandTests(Fixtures, TestCase):
         self.assertEqual(s.test_metrics,{})
         self.assertEqual((stale.val_score,stale.val_metrics),(123.0,{}));self.assertIn(str(stale.pk),err.getvalue())
         self.assertTrue(Audit.objects.filter(action__contains='backfill_metrics').exists())
-        self.finish();services.finalize(self.c.pk);s.refresh_from_db();self.assertEqual(s.test_metrics['rmse'],0)
+        self.finish();services.finalize(self.c.pk);stale.refresh_from_db();self.assertEqual(stale.test_metrics['rmse'],0)  # the last submission is test-scored
 
 class ChangeMetricTests(Fixtures, TestCase):
     """Switching a published problem's ranking metric re-derives stored scores; the admin form stays locked."""
@@ -674,8 +677,8 @@ class ChangeMetricTests(Fixtures, TestCase):
         self.client.force_login(self.u);response=self.client.get(f'/contests/{self.c.pk}/leaderboard/?problem={self.b.pk}')
         self.assertContains(response,'<th>MCC <span class="badge">순위</span></th>');self.assertContains(response,'<th>ROC-AUC</th>')
         self.finish();services.finalize(self.c.pk)
-        choice=FinalChoice.objects.get(user=self.u,problem=self.b);self.assertEqual(choice.submission_id,self.good.pk)
-        self.good.refresh_from_db();self.assertEqual(self.good.test_score,self.good.test_metrics['mcc'])
+        choice=FinalChoice.objects.get(user=self.u,problem=self.b);self.assertEqual(choice.submission_id,self.flat.pk)  # the last one
+        self.flat.refresh_from_db();self.assertEqual(self.flat.test_score,self.flat.test_metrics['mcc'])
     def test_change_is_refused_when_unsafe(self):
         with self.assertRaisesMessage(ValidationError,'중에서 선택하세요'):services.change_ranking_metric(self.b.pk,'rmse',None)  # wrong kind
         with self.assertRaisesMessage(ValidationError,'중에서 선택하세요'):services.change_ranking_metric(self.b.pk,'nope',None)

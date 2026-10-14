@@ -122,6 +122,7 @@ def contest(request, pk, tab='overview'):
     if selected and tab == 'leaderboard':
         qs = Submission.objects.filter(problem=selected, status='scored', user__membership__contest=c, user__membership__status='approved').select_related('user')
         if c.released_at: qs = qs.filter(finalchoice__problem=selected)
+        qs = services.latest_per_user(qs)  # one row per participant: the last submission, not the best one
         seen, secondary = set(), selected.secondary_metrics
         for s in services.ordered_scores(selected, qs, final=bool(c.released_at)):
             if s.user_id not in seen:
@@ -132,10 +133,10 @@ def contest(request, pk, tab='overview'):
                     'extras':[(details or {}).get(m.key) for m in secondary]})
     submissions = []
     if tab == 'submissions':
-        # The submission that counts per problem: the user's best val score (the leaderboard entry) while the contest
-        # runs, the one that was test-scored once finalized.
+        # The submission that counts per problem: the user's last scored submission (the leaderboard entry) while the
+        # contest runs, the one that was test-scored once finalized.
         if c.finalized_at: counted = set(FinalChoice.objects.filter(user=request.user, problem__contest=c).values_list('submission_id', flat=True))
-        else: counted = {pk for p in problems for pk in services.ordered_scores(p, Submission.objects.filter(user=request.user, problem=p, status='scored', received_at__lt=c.closes_at)).values_list('pk', flat=True)[:1]}
+        else: counted = {pk for p in problems for pk in Submission.objects.filter(user=request.user, problem=p, status='scored', received_at__lt=c.closes_at).order_by('-received_at', '-id').values_list('pk', flat=True)[:1]}
         metrics = {}  # problem pk -> metric list, built once per problem instead of per submission
         for s in Submission.objects.filter(user=request.user, problem__contest=c).select_related('problem').order_by('-received_at')[:200]:
             if s.problem_id not in metrics: metrics[s.problem_id] = s.problem.all_metrics
@@ -357,6 +358,7 @@ def export(request,pk):
     for p in c.problems.all():
         qs=Submission.objects.filter(problem=p,status='scored',user__membership__contest=c,user__membership__status='approved').select_related('user')
         if c.released_at: qs=qs.filter(finalchoice__problem=p)
+        qs=services.latest_per_user(qs)
         best={}
         for item in services.ordered_scores(p,qs,final=bool(c.released_at)):
             if item.user_id not in best: best[item.user_id]=(len(best)+1,item)
